@@ -1,0 +1,10 @@
+.env
+data/
+.git/
+node_modules/
+*.log
+*.tsbuildinfo
+.DS_Store
+src/api/dist/
+src/ui/dist/
+src/ui/node_modules/

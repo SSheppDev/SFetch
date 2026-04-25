@@ -1,0 +1,21 @@
+{
+  "name": "sfetch",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "src/api",
+    "src/ui"
+  ],
+  "scripts": {
+    "dev:api": "npm run dev --workspace=src/api",
+    "dev:ui": "npm run dev --workspace=src/ui",
+    "build:ui": "npm run build --workspace=src/ui",
+    "build:api": "npm run build --workspace=src/api",
+    "build": "npm run build:ui && npm run build:api",
+    "export-tokens": "node scripts/export-tokens.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
