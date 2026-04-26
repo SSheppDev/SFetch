@@ -26,10 +26,12 @@ Postgres is exposed on a configurable port (set in `.env`). Any application conn
 Host:      localhost
 Port:      $POSTGRES_PORT
 Database:  sfdb
-Schema:    salesforce
+Schema:    org_<orgid>     # one schema per registered Salesforce org
 User:      $POSTGRES_USER
 Password:  $POSTGRES_PASSWORD
 ```
+
+Every registered org has its own schema named `org_<lowercased 18-char Salesforce org id>` (for example `org_00d5g000001abcdeaa`). The Settings page in the UI lists all registered orgs and their schema names. Each schema contains the same per-object tables (`account`, `contact`, etc.) — pick the schema for the org you want to query.
 
 The internal API is not exposed for external data access. It only serves the web UI and sync orchestration.
 
@@ -42,7 +44,7 @@ The internal API is not exposed for external data access. It only serves the web
 | Database | PostgreSQL (Docker) |
 | Backend API | Node.js + TypeScript + Express |
 | Web UI | React + TypeScript + shadcn/ui + Tailwind (served as static files by Express) |
-| Salesforce Auth | `sf` CLI auth files — read directly from `~/.sf/` via Node `fs` |
+| Salesforce Auth | `sf` CLI auth files — read directly from `~/.sfdx/` via Node `fs` |
 | Salesforce Data | `jsforce` (Bulk API 2.0 + REST fallback) |
 | Scheduling | `node-cron` |
 | Containerization | Docker + Docker Compose |
@@ -133,28 +135,28 @@ Authentication is fully delegated to the Salesforce `sf` CLI. No Salesforce cred
 ### How it works
 
 1. User authenticates once in their terminal: `sf org login web --alias my-org`
-2. `sf` CLI stores OAuth tokens as JSON files in `~/.sf/` on the host
-3. `~/.sf` is bind-mounted read-only into the API container
+2. `sf` CLI stores OAuth tokens as JSON files in `~/.sfdx/` on the host
+3. `~/.sfdx` is bind-mounted read-only into the API container
 4. The API reads the access token and instance URL **directly from the JSON files** via Node `fs` — no `sf` binary required in the container
 5. Tokens are passed to `jsforce` for all Salesforce API calls
 
 ```yaml
 # docker-compose.yml (api service)
 volumes:
-  - ~/.sf:/root/.sf:ro
+  - ${HOME}/.sfdx:/home/app/.sfdx:ro
 ```
 
 No `sf` binary in the Docker image. No version coupling. Lightweight container.
 
 ### Config storage
 
-The active org alias is stored in `sfdb.app_config` in the database — not in `.env`. `.env` is for infrastructure bootstrap only (ports, DB creds). Org selection and all other runtime config is persisted in the DB and survives container restarts.
+Registered orgs live in `sfdb.orgs` (one row per org with `org_id`, `alias`, `username`, `instance_url`, `schema_name`). `sfdb.active_org` is a single-row pointer to the org currently selected in the UI. `.env` is for infrastructure bootstrap only (ports, DB creds). Object selection, field selection, and schedule config live in the DB keyed by `org_id`.
 
 ### Error handling
 
 | Scenario | Behavior |
 |---|---|
-| `~/.sf` not mounted or empty | Onboarding screen shown; instructions to run `sf org login web` |
+| `~/.sfdx` not mounted or empty | Onboarding screen shown; instructions to run `sf org login web` |
 | No org JSON files found | Same as above |
 | Selected org file missing/corrupt | Error banner; prompt to re-authenticate the org |
 | Token expired | Detected on first API call; banner shown in UI |
@@ -163,14 +165,14 @@ The active org alias is stored in `sfdb.app_config` in the database — not in `
 
 ## Web UI — Pages & Flows
 
-### Onboarding (first launch)
+### Onboarding (first launch / add another org)
 
-Shown automatically when no org is configured in `sfdb.app_config`.
+Shown automatically when no orgs are registered in `sfdb.orgs`. Also reachable via the "Add another org" entry in the header org switcher and the "Add org" button on Settings.
 
-1. API reads `~/.sf/` directory for org JSON files
+1. API reads `~/.sfdx/` directory for org JSON files (`GET /api/orgs/available`)
 2. If none found — error state with `sf org login web` instructions
-3. If orgs found — display interactive org picker (alias, username, org type)
-4. User selects org → alias saved to `sfdb.app_config` → proceed to Objects page
+3. If orgs found — display interactive picker; orgs already registered are shown but disabled
+4. User picks an org → `POST /api/orgs` creates the `org_<orgid>` schema, seeds `sfdb.orgs` and `sfdb.sync_lock`, and (for the first org) sets `sfdb.active_org` → proceed to Objects page
 
 ### Objects Page (`/objects`)
 
@@ -206,9 +208,13 @@ Shown automatically when no org is configured in `sfdb.app_config`.
 
 ### Settings Page (`/settings`)
 
-- Switch active org (re-runs onboarding picker)
+- List every registered org (alias, username, org id, schema name); switch active org or remove an org (drops its schema and cascades through `sfdb.*`)
+- Add another org (links back to onboarding picker)
 - View Postgres connection details (host, port, user, password, DB name)
+- Per-schema, per-table size and row-count breakdown
 - Copy connection string for use in external tools
+
+The active-org context is also available everywhere via the header org switcher (every page is scoped to the selected org via the `X-Org-Id` header).
 
 ---
 
@@ -216,9 +222,9 @@ Shown automatically when no org is configured in `sfdb.app_config`.
 
 ### Concurrency Lock
 
-Only one sync can run at a time. Before starting any sync job:
+`sfdb.sync_lock` has one row per registered org. Different orgs sync in parallel; one sync per org is serialized.
 
-1. Check `sfdb.sync_lock` — a single-row table with `locked_at` timestamp
+1. Check `sfdb.sync_lock` for the target `org_id`
 2. If locked and `locked_at` is within the last 30 minutes — skip, log warning
 3. If locked and stale (> 30 min) — assume previous job crashed, take the lock
 4. On completion or error — always release the lock
@@ -249,7 +255,7 @@ Catches hard deletes, merges, and cascade deletes.
 Acquire sync lock
 For each enabled object:
   1. Bulk query: SELECT Id FROM <Object>
-  2. SELECT id FROM salesforce.<object> WHERE sf_deleted_at IS NULL
+  2. SELECT id FROM org_<orgid>.<object> WHERE sf_deleted_at IS NULL
   3. Diff: local_live - sf_live = deleted in Salesforce
   4. SET sf_deleted_at = NOW() on deleted rows
   5. Update last_full_sync in sfdb.sync_config
@@ -273,10 +279,10 @@ The sync engine manages schema changes directly with raw SQL — no migration fr
 
 | Event | DDL executed |
 |---|---|
-| Object enabled | `CREATE TABLE IF NOT EXISTS salesforce.<object> (id text PRIMARY KEY, ...)` |
-| Object disabled + drop | `DROP TABLE salesforce.<object>` |
-| Field re-enabled | `ALTER TABLE salesforce.<object> ADD COLUMN <field> <type>` |
-| Field disabled | `ALTER TABLE salesforce.<object> DROP COLUMN <field>` |
+| Object enabled | `CREATE TABLE IF NOT EXISTS org_<orgid>.<object> (id text PRIMARY KEY, ...)` |
+| Object disabled + drop | `DROP TABLE org_<orgid>.<object>` |
+| Field re-enabled | `ALTER TABLE org_<orgid>.<object> ADD COLUMN <field> <type>` |
+| Field disabled | `ALTER TABLE org_<orgid>.<object> DROP COLUMN <field>` |
 
 DDL is idempotent where possible (`IF NOT EXISTS`, `IF EXISTS`).
 
@@ -284,9 +290,9 @@ DDL is idempotent where possible (`IF NOT EXISTS`, `IF EXISTS`).
 
 ## Postgres Schema
 
-Synced data in `salesforce` schema. Internal metadata in `sfdb` schema.
+Synced data lives in per-org schemas — one schema per registered Salesforce org, named `org_<lowercased orgid>`. Internal metadata lives in the `sfdb` schema.
 
-### Per-object table (e.g. `salesforce.account`)
+### Per-object table (e.g. `org_00d5g000001abcdeaa.account`)
 
 | Column | Type | Notes |
 |---|---|---|
@@ -312,48 +318,50 @@ Synced data in `salesforce` schema. Internal metadata in `sfdb` schema.
 
 ### Internal tables (`sfdb` schema)
 
-**`sfdb.app_config`** — key/value store for runtime config
+All per-object/per-field tables include `org_id` and have `ON DELETE CASCADE` from `sfdb.orgs(org_id)`.
+
+**`sfdb.orgs`** — registered Salesforce orgs
+- `org_id` text PRIMARY KEY
+- `alias` text
+- `username` text
+- `instance_url` text
+- `schema_name` text UNIQUE
+- `added_at` timestamptz
+
+**`sfdb.active_org`** — single-row pointer to the currently selected org
+- `id` integer PRIMARY KEY (always 1, CHECK constrained)
+- `org_id` text REFERENCES sfdb.orgs(org_id) ON DELETE SET NULL
+
+**`sfdb.app_config`** — global key/value runtime config
 - `key` text PRIMARY KEY
 - `value` text
-- Stores: active org alias, global sync enabled/disabled
+- Stores: `auto_sync_enabled`
 
-**`sfdb.sync_config`** — per-object sync state
-- `object_api_name` text PRIMARY KEY
+**`sfdb.sync_config`** — per-org, per-object sync state
+- PRIMARY KEY (`org_id`, `object_api_name`)
 - `enabled` boolean
-- `last_delta_sync` timestamptz
-- `last_full_sync` timestamptz
-- `delta_interval_minutes` integer
-- `full_interval_hours` integer
+- `last_delta_sync` / `last_full_sync` timestamptz
+- `delta_interval_minutes` / `full_interval_hours` integer
+- `has_system_modstamp` / `has_created_date` boolean (auto-detected per object)
+- `sync_order` integer
 
-**`sfdb.field_config`** — per-field enabled state
-- `object_api_name` text
-- `field_api_name` text
-- `pg_column_name` text
-- `enabled` boolean
-- PRIMARY KEY (`object_api_name`, `field_api_name`)
+**`sfdb.field_config`** — per-org, per-field enabled state
+- PRIMARY KEY (`org_id`, `object_api_name`, `field_api_name`)
 
-**`sfdb.field_metadata`** — cached Salesforce field metadata
-- `object_api_name` text
-- `field_api_name` text
-- `label` text
-- `sf_type` text
-- `pg_type` text
-- `nullable` boolean
-- `cached_at` timestamptz
+**`sfdb.field_metadata`** — per-org cached Salesforce field metadata
+- PRIMARY KEY (`org_id`, `object_api_name`, `field_api_name`)
 
 **`sfdb.sync_log`** — record of every sync run
 - `id` serial PRIMARY KEY
-- `object_api_name` text
-- `sync_type` text (`delta` | `full`)
-- `started_at` timestamptz
-- `completed_at` timestamptz
-- `records_upserted` integer
-- `records_deleted` integer
-- `error` text
+- `org_id` text
+- `object_api_name`, `sync_type`, `started_at`, `completed_at`
+- `records_upserted`, `records_deleted`, `total_records`
+- `phase`, `error`
 - Auto-purged: rows older than `LOG_RETENTION_DAYS` days deleted at start of each sync run
 
-**`sfdb.sync_lock`** — concurrency guard
-- Single row: `locked` boolean, `locked_at` timestamptz, `job_type` text
+**`sfdb.sync_lock`** — concurrency guard, one row per registered org
+- `org_id` text PRIMARY KEY
+- `locked` boolean, `locked_at` timestamptz, `job_type` text
 
 ---
 
@@ -398,7 +406,6 @@ dist/
 
 - Custom CLI binary (use `docker compose` directly)
 - File attachments / ContentVersion (planned for v2)
-- Multi-org simultaneous sync (single active org; switch via Settings page)
 - Cloud hosting or remote access
 - Real-time Change Data Capture (CDC) streaming
 - Auth/access control on the web UI (local-only tool)

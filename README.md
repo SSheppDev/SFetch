@@ -54,12 +54,12 @@ Once data is syncing, connect any Postgres-compatible tool directly:
 |----------|-----------------------|
 | Host     | `localhost`           |
 | Port     | `7745`                |
-| Database | `sfdb`               |
-| Schema   | `salesforce`          |
-| User     | `sfdb`               |
+| Database | `sfdb`                |
+| Schema   | `org_<orgid>`         |
+| User     | `sfdb`                |
 | Password | *(your `.env` value)* |
 
-The Settings page in the UI shows a copyable connection string.
+Each registered Salesforce org gets its own schema named `org_<lowercased 18-char Salesforce org id>`. The Settings page in the UI shows the schema name for every registered org and a copyable connection string.
 
 A read-only role is also available — set `READONLY_PASSWORD` in `.env` and connect as user `sfdb_readonly`.
 
@@ -107,7 +107,7 @@ Only one sync runs at a time. A single-row lock table (`sfdb.sync_lock`) prevent
 
 ## Database schema
 
-**`salesforce` schema** — one table per enabled Salesforce object, e.g. `salesforce.account`
+**One schema per registered org** — named `org_<lowercased orgid>`, one table per enabled Salesforce object (e.g. `org_00d5g000001abcdeaa.account`)
 
 | Column | Type | Notes |
 |---|---|---|
@@ -118,7 +118,7 @@ Only one sync runs at a time. A single-row lock table (`sfdb.sync_lock`) prevent
 | `sf_deleted_at` | `timestamptz NULL` | NULL = live; set when deletion detected |
 | `synced_at` | `timestamptz` | Last written by this tool |
 
-**`sfdb` schema** — internal app tables (sync config, logs, lock, field metadata)
+**`sfdb` schema** — internal app tables (`orgs` registry, `active_org` pointer, sync config, logs, per-org lock, field metadata). Per-object tables are keyed by `(org_id, ...)`.
 
 ## Tech stack
 
@@ -127,7 +127,7 @@ Only one sync runs at a time. A single-row lock table (`sfdb.sync_lock`) prevent
 | Database | PostgreSQL 16 |
 | Backend | Node.js + TypeScript + Express |
 | Frontend | React + TypeScript + shadcn/ui + Tailwind |
-| Salesforce auth | `~/.sfdx` files read directly via Node `fs` (no `sf` binary in container) |
+| Salesforce auth | `~/.sfdx` files read directly via Node `fs` (no `sf` binary in container) — multiple orgs supported, each gets its own Postgres schema |
 | Salesforce data | jsforce + Bulk API 2.0 |
 | Scheduling | node-cron |
 | Containers | Docker + Docker Compose |
