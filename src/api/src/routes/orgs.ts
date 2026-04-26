@@ -110,13 +110,29 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
       return
     }
 
-    // Validate the token works before persisting anything
-    try {
-      await getOrgToken(aliasOrUsername)
-    } catch (err) {
+    // Validate that we have a usable token for this org. The alias the picker
+    // shows comes from ~/.sfdx/alias.json and may have been renamed since the
+    // last `npm run export-tokens`, so fall back to username if alias lookup
+    // fails — tokens.json is keyed by both.
+    let lastErr: Error | null = null
+    let resolved = false
+    for (const key of [aliasOrUsername, match.alias, match.username].filter(
+      (v): v is string => typeof v === 'string' && v.length > 0
+    )) {
+      try {
+        await getOrgToken(key)
+        resolved = true
+        break
+      } catch (err) {
+        lastErr = err as Error
+      }
+    }
+    if (!resolved) {
       res.status(400).json({
         error: 'Could not authenticate with the selected org',
-        details: (err as Error).message,
+        details:
+          (lastErr?.message ?? 'no token entry found') +
+          ' — refresh tokens by running `npm run export-tokens` on the host',
       })
       return
     }

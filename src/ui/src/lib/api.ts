@@ -26,7 +26,13 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     if (body?.code === 'SF_SESSION_EXPIRED') {
       window.dispatchEvent(new CustomEvent(SF_SESSION_EXPIRED_EVENT))
     }
-    throw new Error(body.error ?? res.statusText)
+    const detail = typeof body?.details === 'string' ? body.details : null
+    const message = body?.error
+      ? detail
+        ? `${body.error}: ${detail}`
+        : body.error
+      : res.statusText
+    throw new Error(message)
   }
   return res.json() as Promise<T>
 }

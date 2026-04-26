@@ -36,6 +36,10 @@ services:
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT_INTERNAL: 5432
+      # Cap V8 old-space below the cgroup limit so the GC can recover before the
+      # OS kills the process. Large bulk-API result pages (700k+ records) can
+      # otherwise blow past the default heap before streaming releases memory.
+      NODE_OPTIONS: --max-old-space-size=1536
     ports:
       - "127.0.0.1:${APP_PORT:-7743}:7743"
     volumes:
@@ -49,7 +53,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512m
+          memory: 2g
           cpus: '1.0'
 
 networks:
