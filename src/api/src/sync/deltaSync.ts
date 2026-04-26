@@ -1,7 +1,7 @@
 import { getOrgToken } from '../auth/sfAuth'
 import { createBulkClient } from '../salesforce/bulkClient'
 import { pool } from '../db/pool'
-import { getTableRowCount } from './ddlManager'
+import { getTableRowCount, tableRefForOrg } from './ddlManager'
 
 // ---------------------------------------------------------------------------
 // SF fields handled as system columns — never selected from field_config
@@ -33,6 +33,11 @@ interface FieldInfo {
   pgType: string  // postgres type         e.g. 'text'
 }
 
+interface OrgRow {
+  alias: string | null
+  username: string
+}
+
 /**
  * Which audit fields a specific object actually exposes in Salesforce.
  * Most objects have CreatedDate + SystemModstamp; some metadata/junction
@@ -45,18 +50,34 @@ interface ObjectAuditFields {
 }
 
 // ---------------------------------------------------------------------------
+// Org lookup
+// ---------------------------------------------------------------------------
+
+async function resolveOrgAuthKey(orgId: string): Promise<string> {
+  const result = await pool.query<OrgRow>(
+    `SELECT alias, username FROM sfdb.orgs WHERE org_id = $1`,
+    [orgId]
+  )
+  const row = result.rows[0]
+  if (!row) throw new Error(`runDeltaSync: org "${orgId}" is not registered`)
+  // Prefer alias; fall back to username for orgs without an alias mapping
+  return row.alias ?? row.username
+}
+
+// ---------------------------------------------------------------------------
 // Sync log helpers
 // ---------------------------------------------------------------------------
 
 async function startSyncLog(
+  orgId: string,
   objectApiName: string,
   syncType: 'delta' | 'full'
 ): Promise<number> {
   const result = await pool.query<{ id: number }>(
-    `INSERT INTO sfdb.sync_log (object_api_name, sync_type, started_at, phase)
-     VALUES ($1, $2, NOW(), 'queuing')
+    `INSERT INTO sfdb.sync_log (org_id, object_api_name, sync_type, started_at, phase)
+     VALUES ($1, $2, $3, NOW(), 'queuing')
      RETURNING id`,
-    [objectApiName, syncType]
+    [orgId, objectApiName, syncType]
   )
   return result.rows[0].id
 }
@@ -130,11 +151,9 @@ function selectExpr(pgName: string, pgType: string): string {
 
 /**
  * Upsert a batch of SF records using UNNEST (one text[] per column).
- * Fixes two problems with the old VALUES approach:
- *  1. O(rows×cols) params exceeded pg wire-protocol limits for large batches
- *  2. SF field names are mixed-case; pgName lookup was all-lowercase → all nulls
  */
 async function upsertBatch(
+  orgId: string,
   objectApiName: string,
   auditFields: ObjectAuditFields,
   fields: FieldInfo[],
@@ -142,7 +161,7 @@ async function upsertBatch(
 ): Promise<number> {
   if (batch.length === 0) return 0
 
-  const table = `salesforce.${objectApiName.toLowerCase()}`
+  const table = tableRefForOrg(orgId, objectApiName)
 
   // One value array per column
   const ids: (string | null)[] = []
@@ -198,8 +217,9 @@ ON CONFLICT (id) DO UPDATE SET
 // Main export
 // ---------------------------------------------------------------------------
 
-export async function runDeltaSync(orgAlias: string, targetObject?: string): Promise<void> {
-  const token = await getOrgToken(orgAlias)
+export async function runDeltaSync(orgId: string, targetObject?: string): Promise<void> {
+  const authKey = await resolveOrgAuthKey(orgId)
+  const token = await getOrgToken(authKey)
   const bulkClient = createBulkClient({
     accessToken: token.accessToken,
     instanceUrl: token.instanceUrl,
@@ -209,14 +229,15 @@ export async function runDeltaSync(orgAlias: string, targetObject?: string): Pro
     ? await pool.query<SyncConfigRow>(
         `SELECT object_api_name, last_delta_sync, has_system_modstamp, has_created_date
          FROM sfdb.sync_config
-         WHERE enabled = true AND object_api_name = $1`,
-        [targetObject]
+         WHERE org_id = $1 AND enabled = true AND object_api_name = $2`,
+        [orgId, targetObject]
       )
     : await pool.query<SyncConfigRow>(
         `SELECT object_api_name, last_delta_sync, has_system_modstamp, has_created_date
          FROM sfdb.sync_config
-         WHERE enabled = true
-         ORDER BY sync_order ASC, object_api_name ASC`
+         WHERE org_id = $1 AND enabled = true
+         ORDER BY sync_order ASC, object_api_name ASC`,
+        [orgId]
       )
 
   for (const obj of configResult.rows) {
@@ -231,13 +252,10 @@ export async function runDeltaSync(orgAlias: string, targetObject?: string): Pro
     let recordsUpserted = 0
 
     try {
-      logId = await startSyncLog(objectApiName, 'delta')
+      logId = await startSyncLog(orgId, objectApiName, 'delta')
       const syncMode = lastDeltaSync === null ? 'initial full load' : 'delta'
-      console.log(`[delta-sync] ${objectApiName}: starting ${syncMode}`)
+      console.log(`[delta-sync] [${orgId}] ${objectApiName}: starting ${syncMode}`)
 
-      // Fetch enabled user fields with their PG types.
-      // When an object uses LastModifiedDate as its tracking field (no SystemModstamp),
-      // exclude LastModifiedDate from user fields — it is promoted to a system field.
       const trackingField = hasSystemModstamp ? 'SystemModstamp' : 'LastModifiedDate'
       let auditFields: ObjectAuditFields = {
         hasCreatedDate,
@@ -250,18 +268,19 @@ export async function runDeltaSync(orgAlias: string, targetObject?: string): Pro
                 COALESCE(fm.pg_type, 'text')   AS pg_type
          FROM sfdb.field_config fc
          LEFT JOIN sfdb.field_metadata fm
-           ON  fm.object_api_name = fc.object_api_name
+           ON  fm.org_id          = fc.org_id
+           AND fm.object_api_name = fc.object_api_name
            AND fm.field_api_name  = fc.field_api_name
-         WHERE fc.object_api_name = $1
+         WHERE fc.org_id = $1
+           AND fc.object_api_name = $2
            AND fc.enabled = true`,
-        [objectApiName]
+        [orgId, objectApiName]
       )
 
       const fields: FieldInfo[] = fieldResult.rows
         .filter((r) =>
           !SF_SYSTEM_FIELDS.has(r.field_api_name) &&
           !SF_COMPOUND_TYPES.has(r.sf_type.toLowerCase()) &&
-          // When LastModifiedDate is the tracking field, exclude it from user fields
           !(r.field_api_name === 'LastModifiedDate' && !hasSystemModstamp)
         )
         .map((r) => ({
@@ -270,7 +289,6 @@ export async function runDeltaSync(orgAlias: string, targetObject?: string): Pro
           pgType: r.pg_type,
         }))
 
-      // Build SOQL — only include audit fields the object actually has
       const systemSelect = ['Id']
       if (hasCreatedDate) systemSelect.push('CreatedDate')
       systemSelect.push(trackingField)
@@ -283,26 +301,23 @@ export async function runDeltaSync(orgAlias: string, targetObject?: string): Pro
       }
       soql += ` ORDER BY ${trackingField} ASC`
 
-      // Phase 1: queuing / polling Salesforce Bulk API
       await updateSyncProgress(logId, 'polling')
 
-      const localRowCount = await getTableRowCount(objectApiName)
+      const localRowCount = await getTableRowCount(orgId, objectApiName)
       const estimatedRows = localRowCount !== null && localRowCount > 0 ? localRowCount : undefined
 
       let queryResult = await bulkClient.query(soql, estimatedRows).catch(async (err: Error) => {
-        // Self-heal: if SF says SystemModstamp/CreatedDate doesn't exist on this object,
-        // update sync_config and retry with LastModifiedDate
         const msg = err.message ?? ''
         const missingModstamp = msg.includes("No such column 'SystemModstamp'") || msg.includes("No such column 'CreatedDate'")
         if (!missingModstamp) throw err
 
-        console.warn(`[delta-sync] ${objectApiName}: object lacks standard audit fields — switching to LastModifiedDate`)
+        console.warn(`[delta-sync] [${orgId}] ${objectApiName}: object lacks standard audit fields — switching to LastModifiedDate`)
         await pool.query(
-          `UPDATE sfdb.sync_config SET has_system_modstamp = false, has_created_date = false WHERE object_api_name = $1`,
-          [objectApiName]
+          `UPDATE sfdb.sync_config SET has_system_modstamp = false, has_created_date = false
+           WHERE org_id = $1 AND object_api_name = $2`,
+          [orgId, objectApiName]
         )
 
-        // Rebuild SOQL without CreatedDate/SystemModstamp, using LastModifiedDate
         const fallbackFields = fields.filter((f) => f.sfName !== 'LastModifiedDate')
         const fallbackSelect = ['Id', 'LastModifiedDate', ...fallbackFields.map((f) => f.sfName)].join(', ')
         let fallbackSoql = `SELECT ${fallbackSelect} FROM ${objectApiName}`
@@ -315,34 +330,34 @@ export async function runDeltaSync(orgAlias: string, targetObject?: string): Pro
         return bulkClient.query(fallbackSoql, estimatedRows)
       })
 
-      // Phase 2: streaming — we now know the total record count
       await updateSyncProgress(logId, 'streaming', 0, queryResult.totalSize)
-      console.log(`[delta-sync] ${objectApiName}: streaming ${queryResult.totalSize} records`)
+      console.log(`[delta-sync] [${orgId}] ${objectApiName}: streaming ${queryResult.totalSize} records`)
 
       let batch: Array<Record<string, string | null>> = []
 
       for await (const record of queryResult.records) {
         batch.push(record)
         if (batch.length >= BATCH_SIZE) {
-          recordsUpserted += await upsertBatch(objectApiName, auditFields, fields, batch)
+          recordsUpserted += await upsertBatch(orgId, objectApiName, auditFields, fields, batch)
           batch = []
           void updateSyncProgress(logId, 'streaming', recordsUpserted)
         }
       }
       if (batch.length > 0) {
-        recordsUpserted += await upsertBatch(objectApiName, auditFields, fields, batch)
+        recordsUpserted += await upsertBatch(orgId, objectApiName, auditFields, fields, batch)
       }
 
       await pool.query(
-        `UPDATE sfdb.sync_config SET last_delta_sync = NOW() WHERE object_api_name = $1`,
-        [objectApiName]
+        `UPDATE sfdb.sync_config SET last_delta_sync = NOW()
+         WHERE org_id = $1 AND object_api_name = $2`,
+        [orgId, objectApiName]
       )
 
-      console.log(`[delta-sync] ${objectApiName}: complete — ${recordsUpserted} rows upserted`)
+      console.log(`[delta-sync] [${orgId}] ${objectApiName}: complete — ${recordsUpserted} rows upserted`)
       await writeSyncLog(logId, recordsUpserted, 0)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      console.error(`[delta-sync] Error syncing ${objectApiName}: ${message}`)
+      console.error(`[delta-sync] [${orgId}] Error syncing ${objectApiName}: ${message}`)
       if (logId !== undefined) {
         await writeSyncLog(logId, recordsUpserted, 0, message)
       }
