@@ -5,6 +5,7 @@ import rateLimit from 'express-rate-limit'
 import path from 'path'
 import { pool } from './db/pool'
 import { migrateToMultiOrg, ensureSyncLockRows } from './db/migrate'
+import { startScheduler } from './sync/scheduler'
 
 // ---------------------------------------------------------------------------
 // Route imports
@@ -163,5 +164,9 @@ export async function initApp(): Promise<void> {
     console.warn('[startup] Could not clear stale sync state:', (err as Error).message)
   }
 
-  // Per-org scheduler is wired up in a subsequent commit.
+  try {
+    startScheduler()
+  } catch (err) {
+    console.warn('[startup] Could not start scheduler:', (err as Error).message)
+  }
 }
