@@ -1,23 +1,23 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { pool } from '../db/pool'
+import { requireOrgId } from './_orgContext'
 
 const router = Router()
 
-// ---------------------------------------------------------------------------
-// GET /api/sync-order
-// Returns all enabled objects sorted by sync_order ASC, then name ASC
-// ---------------------------------------------------------------------------
-
-router.get('/', async (_req: Request, res: Response, next: NextFunction) => {
+router.get('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const orgId = await requireOrgId(req, res)
+    if (!orgId) return
+
     const result = await pool.query<{
       object_api_name: string
       sync_order: number
     }>(
       `SELECT object_api_name, sync_order
        FROM sfdb.sync_config
-       WHERE enabled = true
-       ORDER BY sync_order ASC, object_api_name ASC`
+       WHERE org_id = $1 AND enabled = true
+       ORDER BY sync_order ASC, object_api_name ASC`,
+      [orgId]
     )
 
     res.json(
@@ -31,12 +31,6 @@ router.get('/', async (_req: Request, res: Response, next: NextFunction) => {
   }
 })
 
-// ---------------------------------------------------------------------------
-// PUT /api/sync-order
-// Body: [{ objectApiName: string, syncOrder: number }]
-// Saves the full ordered list atomically
-// ---------------------------------------------------------------------------
-
 interface SyncOrderItem {
   objectApiName: string
   syncOrder: number
@@ -44,6 +38,9 @@ interface SyncOrderItem {
 
 router.put('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const orgId = await requireOrgId(req, res)
+    if (!orgId) return
+
     const items = req.body as SyncOrderItem[]
 
     if (!Array.isArray(items)) {
@@ -56,8 +53,9 @@ router.put('/', async (req: Request, res: Response, next: NextFunction) => {
       await client.query('BEGIN')
       for (const { objectApiName, syncOrder } of items) {
         await client.query(
-          `UPDATE sfdb.sync_config SET sync_order = $1 WHERE object_api_name = $2`,
-          [syncOrder, objectApiName]
+          `UPDATE sfdb.sync_config SET sync_order = $1
+           WHERE org_id = $2 AND object_api_name = $3`,
+          [syncOrder, orgId, objectApiName]
         )
       }
       await client.query('COMMIT')

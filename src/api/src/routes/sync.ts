@@ -7,42 +7,33 @@ import {
   triggerFullSyncForObject,
   getSyncLockStatus,
 } from '../sync/scheduler'
+import { requireOrgId } from './_orgContext'
 
 const router = Router()
 
-// ---------------------------------------------------------------------------
-// Helper — read active org alias from app_config
-// ---------------------------------------------------------------------------
-
-async function getActiveAlias(): Promise<string | null> {
-  const result = await pool.query<{ value: string }>(
-    `SELECT value FROM sfdb.app_config WHERE key = 'active_org_alias'`
-  )
-  return result.rows[0]?.value ?? null
+function inProgressErrorResponse(err: unknown, res: Response): boolean {
+  const msg = (err as Error).message ?? ''
+  if (msg.toLowerCase().includes('lock') || msg.toLowerCase().includes('in progress')) {
+    res.status(409).json({ error: 'Sync already in progress' })
+    return true
+  }
+  return false
 }
 
 // ---------------------------------------------------------------------------
 // POST /api/sync/delta
-// Trigger a delta sync for the active org
 // ---------------------------------------------------------------------------
 
-router.post('/delta', async (_req: Request, res: Response, next: NextFunction) => {
+router.post('/delta', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const alias = await getActiveAlias()
-    if (!alias) {
-      res.status(400).json({ error: 'No active org configured' })
-      return
-    }
+    const orgId = await requireOrgId(req, res)
+    if (!orgId) return
 
     try {
-      await triggerDeltaSync(alias)
+      await triggerDeltaSync(orgId)
       res.json({ ok: true })
     } catch (err) {
-      const msg = (err as Error).message ?? ''
-      if (msg.toLowerCase().includes('lock') || msg.toLowerCase().includes('in progress')) {
-        res.status(409).json({ error: 'Sync already in progress' })
-        return
-      }
+      if (inProgressErrorResponse(err, res)) return
       throw err
     }
   } catch (err) {
@@ -52,26 +43,18 @@ router.post('/delta', async (_req: Request, res: Response, next: NextFunction) =
 
 // ---------------------------------------------------------------------------
 // POST /api/sync/full
-// Trigger a full ID reconciliation sync for the active org
 // ---------------------------------------------------------------------------
 
-router.post('/full', async (_req: Request, res: Response, next: NextFunction) => {
+router.post('/full', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const alias = await getActiveAlias()
-    if (!alias) {
-      res.status(400).json({ error: 'No active org configured' })
-      return
-    }
+    const orgId = await requireOrgId(req, res)
+    if (!orgId) return
 
     try {
-      await triggerFullSync(alias)
+      await triggerFullSync(orgId)
       res.json({ ok: true })
     } catch (err) {
-      const msg = (err as Error).message ?? ''
-      if (msg.toLowerCase().includes('lock') || msg.toLowerCase().includes('in progress')) {
-        res.status(409).json({ error: 'Sync already in progress' })
-        return
-      }
+      if (inProgressErrorResponse(err, res)) return
       throw err
     }
   } catch (err) {
@@ -81,27 +64,19 @@ router.post('/full', async (_req: Request, res: Response, next: NextFunction) =>
 
 // ---------------------------------------------------------------------------
 // POST /api/sync/delta/:objectApiName
-// Trigger a delta sync for a specific object
 // ---------------------------------------------------------------------------
 
 router.post('/delta/:objectApiName', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const alias = await getActiveAlias()
-    if (!alias) {
-      res.status(400).json({ error: 'No active org configured' })
-      return
-    }
+    const orgId = await requireOrgId(req, res)
+    if (!orgId) return
     const { objectApiName } = req.params
 
     try {
-      await triggerDeltaSyncForObject(alias, objectApiName)
+      await triggerDeltaSyncForObject(orgId, objectApiName)
       res.json({ ok: true })
     } catch (err) {
-      const msg = (err as Error).message ?? ''
-      if (msg.toLowerCase().includes('lock') || msg.toLowerCase().includes('in progress')) {
-        res.status(409).json({ error: 'Sync already in progress' })
-        return
-      }
+      if (inProgressErrorResponse(err, res)) return
       throw err
     }
   } catch (err) {
@@ -111,27 +86,19 @@ router.post('/delta/:objectApiName', async (req: Request, res: Response, next: N
 
 // ---------------------------------------------------------------------------
 // POST /api/sync/full/:objectApiName
-// Trigger a full reconciliation for a specific object
 // ---------------------------------------------------------------------------
 
 router.post('/full/:objectApiName', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const alias = await getActiveAlias()
-    if (!alias) {
-      res.status(400).json({ error: 'No active org configured' })
-      return
-    }
+    const orgId = await requireOrgId(req, res)
+    if (!orgId) return
     const { objectApiName } = req.params
 
     try {
-      await triggerFullSyncForObject(alias, objectApiName)
+      await triggerFullSyncForObject(orgId, objectApiName)
       res.json({ ok: true })
     } catch (err) {
-      const msg = (err as Error).message ?? ''
-      if (msg.toLowerCase().includes('lock') || msg.toLowerCase().includes('in progress')) {
-        res.status(409).json({ error: 'Sync already in progress' })
-        return
-      }
+      if (inProgressErrorResponse(err, res)) return
       throw err
     }
   } catch (err) {
@@ -141,7 +108,6 @@ router.post('/full/:objectApiName', async (req: Request, res: Response, next: Ne
 
 // ---------------------------------------------------------------------------
 // GET /api/sync/status
-// Return lock status + per-object sync state for all enabled objects
 // ---------------------------------------------------------------------------
 
 interface ObjectSyncStatus {
@@ -153,9 +119,12 @@ interface ObjectSyncStatus {
   fullIntervalHours: number | null
 }
 
-router.get('/status', async (_req: Request, res: Response, next: NextFunction) => {
+router.get('/status', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const lockStatus = await getSyncLockStatus()
+    const orgId = await requireOrgId(req, res)
+    if (!orgId) return
+
+    const lockStatus = await getSyncLockStatus(orgId)
 
     const syncConfigResult = await pool.query<{
       object_api_name: string
@@ -168,7 +137,8 @@ router.get('/status', async (_req: Request, res: Response, next: NextFunction) =
       `SELECT object_api_name, enabled, last_delta_sync, last_full_sync,
               delta_interval_minutes, full_interval_hours
        FROM sfdb.sync_config
-       WHERE enabled = true`
+       WHERE org_id = $1 AND enabled = true`,
+      [orgId]
     )
 
     const objects: ObjectSyncStatus[] = syncConfigResult.rows.map((row) => ({
@@ -180,7 +150,6 @@ router.get('/status', async (_req: Request, res: Response, next: NextFunction) =
       fullIntervalHours: row.full_interval_hours,
     }))
 
-    // Current in-progress object + live progress from open sync_log row
     const progressResult = await pool.query<{
       object_api_name: string
       records_upserted: number
@@ -189,9 +158,10 @@ router.get('/status', async (_req: Request, res: Response, next: NextFunction) =
     }>(
       `SELECT object_api_name, records_upserted, total_records, phase
        FROM sfdb.sync_log
-       WHERE completed_at IS NULL
+       WHERE org_id = $1 AND completed_at IS NULL
        ORDER BY started_at DESC
-       LIMIT 1`
+       LIMIT 1`,
+      [orgId]
     )
     const openRow = progressResult.rows[0] ?? null
     const currentObject = openRow?.object_api_name ?? null
@@ -218,11 +188,13 @@ router.get('/status', async (_req: Request, res: Response, next: NextFunction) =
 
 // ---------------------------------------------------------------------------
 // GET /api/sync/progress
-// Return the latest in-progress sync_log entry (poll-friendly)
 // ---------------------------------------------------------------------------
 
-router.get('/progress', async (_req: Request, res: Response, next: NextFunction) => {
+router.get('/progress', async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const orgId = await requireOrgId(req, res)
+    if (!orgId) return
+
     const result = await pool.query<{
       id: number
       object_api_name: string
@@ -236,9 +208,10 @@ router.get('/progress', async (_req: Request, res: Response, next: NextFunction)
       `SELECT id, object_api_name, sync_type, started_at, completed_at,
               records_upserted, records_deleted, error
        FROM sfdb.sync_log
-       WHERE completed_at IS NULL
+       WHERE org_id = $1 AND completed_at IS NULL
        ORDER BY started_at DESC
-       LIMIT 1`
+       LIMIT 1`,
+      [orgId]
     )
 
     const entry = result.rows[0] ?? null
