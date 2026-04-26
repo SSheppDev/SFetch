@@ -1,11 +1,10 @@
-import { useEffect, useState } from 'react'
+import { useEffect } from 'react'
 import { Routes, Route, Navigate, useNavigate } from 'react-router-dom'
 import { Layout } from './components/Layout'
 import { SessionExpiredBanner } from './components/SessionExpiredBanner'
 import { Toaster } from './components/ui/toaster'
-import { api } from './lib/api'
+import { OrgProvider, useOrg } from './lib/orgContext'
 
-// Pages (lazy-ish — just imported directly for simplicity)
 import Onboarding from './pages/Onboarding'
 import Objects from './pages/Objects'
 import Fields from './pages/Fields'
@@ -16,23 +15,15 @@ import SyncOrder from './pages/SyncOrder'
 
 function OrgGuard({ children }: { children: React.ReactNode }) {
   const navigate = useNavigate()
-  const [checking, setChecking] = useState(true)
+  const { orgs, loading } = useOrg()
 
   useEffect(() => {
-    api
-      .get<{ configured: boolean }>('/orgs/status')
-      .then((res) => {
-        if (!res.configured) {
-          navigate('/onboarding', { replace: true })
-        }
-      })
-      .catch(() => {
-        navigate('/onboarding', { replace: true })
-      })
-      .finally(() => setChecking(false))
-  }, [navigate])
+    if (!loading && orgs.length === 0) {
+      navigate('/onboarding', { replace: true })
+    }
+  }, [loading, orgs, navigate])
 
-  if (checking) {
+  if (loading) {
     return (
       <div className="flex h-screen items-center justify-center">
         <div className="h-6 w-6 animate-spin rounded-full border-2 border-[var(--color-primary)] border-t-transparent" />
@@ -40,12 +31,14 @@ function OrgGuard({ children }: { children: React.ReactNode }) {
     )
   }
 
+  if (orgs.length === 0) return null
+
   return <>{children}</>
 }
 
 export default function App() {
   return (
-    <>
+    <OrgProvider>
       <Routes>
         <Route path="/onboarding" element={<Onboarding />} />
         <Route
@@ -66,6 +59,6 @@ export default function App() {
       </Routes>
       <SessionExpiredBanner />
       <Toaster />
-    </>
+    </OrgProvider>
   )
 }

@@ -1,38 +1,35 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Database, AlertCircle, Loader2, User } from 'lucide-react'
+import { Database, AlertCircle, Loader2, User, CheckCircle2 } from 'lucide-react'
 import { api } from '@/lib/api'
-import { type Org } from '@/types'
+import { useOrg } from '@/lib/orgContext'
+import { type AvailableOrg, type AvailableOrgsResponse } from '@/types'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { toast } from '@/components/ui/use-toast'
 
-interface OrgsResponse {
-  mounted: boolean
-  orgs: Org[]
-}
-
 type PageState =
   | { status: 'loading' }
   | { status: 'cli-error'; message: string }
   | { status: 'no-orgs' }
-  | { status: 'ready'; orgs: Org[] }
+  | { status: 'ready'; orgs: AvailableOrg[] }
 
 export default function Onboarding() {
   const navigate = useNavigate()
+  const { refresh: refreshOrgs, setActiveOrgId, orgs: registeredOrgs } = useOrg()
   const [pageState, setPageState] = useState<PageState>({ status: 'loading' })
-  const [selecting, setSelecting] = useState<string | null>(null)
+  const [registering, setRegistering] = useState<string | null>(null)
 
   useEffect(() => {
     api
-      .get<OrgsResponse>('/orgs')
+      .get<AvailableOrgsResponse>('/orgs/available')
       .then((res) => {
         if (!res.mounted) {
           setPageState({
             status: 'cli-error',
             message:
-              'The ~/.sf directory is not accessible. Make sure it is mounted into the Docker container.',
+              'The ~/.sfdx directory is not accessible. Make sure it is mounted into the Docker container.',
           })
           return
         }
@@ -46,41 +43,46 @@ export default function Onboarding() {
         setPageState({
           status: 'cli-error',
           message:
-            'Could not reach the API or read ~/.sf. Check that Docker is running.',
+            'Could not reach the API or read ~/.sfdx. Check that Docker is running.',
         })
       })
   }, [])
 
-  async function handleSelectOrg(alias: string) {
-    setSelecting(alias)
+  async function handleRegister(org: AvailableOrg) {
+    const key = org.alias ?? org.username
+    setRegistering(org.orgId)
     try {
-      await api.post('/orgs/active', { alias })
+      await api.post('/orgs', { aliasOrUsername: key })
+      await refreshOrgs()
+      await setActiveOrgId(org.orgId)
       navigate('/objects', { replace: true })
     } catch (err) {
       toast({
         variant: 'destructive',
-        title: 'Failed to set active org',
+        title: 'Failed to register org',
         description: err instanceof Error ? err.message : 'Unknown error',
       })
     } finally {
-      setSelecting(null)
+      setRegistering(null)
     }
   }
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center bg-[var(--color-background)] px-4">
-      {/* Header */}
+    <div className="min-h-screen flex flex-col items-center justify-center bg-[var(--color-background)] px-4 py-12">
       <div className="mb-8 text-center">
         <div className="mx-auto mb-4 h-12 w-12 rounded-xl bg-[var(--color-primary)] flex items-center justify-center">
           <Database className="h-6 w-6 text-white" />
         </div>
-        <h1 className="text-2xl font-bold text-[var(--color-foreground)]">Welcome to sfetch</h1>
+        <h1 className="text-2xl font-bold text-[var(--color-foreground)]">
+          {registeredOrgs.length > 0 ? 'Add another Salesforce org' : 'Welcome to sfetch'}
+        </h1>
         <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-          Connect a Salesforce org to get started
+          {registeredOrgs.length > 0
+            ? 'Pick another org to register. Each org gets its own Postgres schema.'
+            : 'Connect a Salesforce org to get started'}
         </p>
       </div>
 
-      {/* Loading */}
       {pageState.status === 'loading' && (
         <div className="flex items-center gap-2 text-[var(--color-muted-foreground)]">
           <Loader2 className="h-5 w-5 animate-spin" />
@@ -88,7 +90,6 @@ export default function Onboarding() {
         </div>
       )}
 
-      {/* CLI not mounted / error */}
       {pageState.status === 'cli-error' && (
         <Card className="w-full max-w-md">
           <CardHeader>
@@ -115,7 +116,6 @@ export default function Onboarding() {
         </Card>
       )}
 
-      {/* No orgs found */}
       {pageState.status === 'no-orgs' && (
         <Card className="w-full max-w-md">
           <CardHeader>
@@ -126,7 +126,7 @@ export default function Onboarding() {
           </CardHeader>
           <CardContent className="space-y-3">
             <p className="text-sm text-[var(--color-muted-foreground)]">
-              No Salesforce orgs were found in ~/.sf. Authenticate at least one org first.
+              No Salesforce orgs were found in ~/.sfdx. Authenticate at least one org first.
             </p>
             <div className="rounded-md bg-[var(--color-muted)] px-3 py-2">
               <p className="text-xs font-medium text-[var(--color-foreground)] mb-1">
@@ -143,50 +143,74 @@ export default function Onboarding() {
         </Card>
       )}
 
-      {/* Org picker */}
       {pageState.status === 'ready' && (
         <div className="w-full max-w-md space-y-3">
           <p className="text-sm text-center text-[var(--color-muted-foreground)]">
-            Select an org to connect:
+            Select an org to register:
           </p>
-          {pageState.orgs.map((org) => (
-            <button
-              key={org.alias}
-              onClick={() => handleSelectOrg(org.alias)}
-              disabled={selecting !== null}
-              className="w-full text-left rounded-lg border border-[var(--color-border)] bg-[var(--color-card)] px-4 py-3 hover:border-[var(--color-primary)] hover:bg-[var(--color-accent)] transition-colors disabled:opacity-60 disabled:pointer-events-none focus:outline-none focus:ring-2 focus:ring-[var(--color-ring)]"
-            >
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <div className="h-8 w-8 rounded-full bg-[var(--color-secondary)] flex items-center justify-center flex-shrink-0">
-                    {selecting === org.alias ? (
-                      <Loader2 className="h-4 w-4 animate-spin text-[var(--color-primary)]" />
-                    ) : (
-                      <User className="h-4 w-4 text-[var(--color-muted-foreground)]" />
-                    )}
+          {pageState.orgs.map((org) => {
+            const label = org.alias ?? org.username
+            const isRegistered = org.registered
+            const isThisRegistering = registering === org.orgId
+            return (
+              <button
+                key={org.orgId}
+                onClick={() => !isRegistered && handleRegister(org)}
+                disabled={registering !== null || isRegistered}
+                className="w-full text-left rounded-lg border border-[var(--color-border)] bg-[var(--color-card)] px-4 py-3 hover:border-[var(--color-primary)] hover:bg-[var(--color-accent)] transition-colors disabled:opacity-60 disabled:pointer-events-none focus:outline-none focus:ring-2 focus:ring-[var(--color-ring)]"
+              >
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <div className="h-8 w-8 rounded-full bg-[var(--color-secondary)] flex items-center justify-center flex-shrink-0">
+                      {isThisRegistering ? (
+                        <Loader2 className="h-4 w-4 animate-spin text-[var(--color-primary)]" />
+                      ) : isRegistered ? (
+                        <CheckCircle2 className="h-4 w-4 text-[var(--color-primary)]" />
+                      ) : (
+                        <User className="h-4 w-4 text-[var(--color-muted-foreground)]" />
+                      )}
+                    </div>
+                    <div>
+                      <p className="text-sm font-semibold text-[var(--color-foreground)]">
+                        {label}
+                      </p>
+                      <p className="text-xs text-[var(--color-muted-foreground)]">{org.username}</p>
+                      <p className="text-[10px] font-mono text-[var(--color-muted-foreground)] mt-0.5">
+                        {org.orgId}
+                      </p>
+                    </div>
                   </div>
-                  <div>
-                    <p className="text-sm font-semibold text-[var(--color-foreground)]">
-                      {org.alias}
-                    </p>
-                    <p className="text-xs text-[var(--color-muted-foreground)]">{org.username}</p>
-                  </div>
+                  {isRegistered && (
+                    <Badge variant="secondary" className="text-xs">
+                      Registered
+                    </Badge>
+                  )}
                 </div>
-                <Badge variant="secondary" className="text-xs">
-                  {org.orgType}
-                </Badge>
-              </div>
-            </button>
-          ))}
-          <Button
-            variant="ghost"
-            size="sm"
-            className="w-full"
-            onClick={() => window.location.reload()}
-            disabled={selecting !== null}
-          >
-            Refresh org list
-          </Button>
+              </button>
+            )
+          })}
+          <div className="flex gap-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="flex-1"
+              onClick={() => window.location.reload()}
+              disabled={registering !== null}
+            >
+              Refresh org list
+            </Button>
+            {registeredOrgs.length > 0 && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="flex-1"
+                onClick={() => navigate('/objects')}
+                disabled={registering !== null}
+              >
+                Back to app
+              </Button>
+            )}
+          </div>
         </div>
       )}
     </div>
