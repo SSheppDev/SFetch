@@ -4,7 +4,7 @@ import helmet from 'helmet'
 import rateLimit from 'express-rate-limit'
 import path from 'path'
 import { pool } from './db/pool'
-import { startScheduler } from './sync/scheduler'
+import { migrateToMultiOrg, ensureSyncLockRows } from './db/migrate'
 
 // ---------------------------------------------------------------------------
 // Route imports
@@ -137,12 +137,19 @@ export function createApp() {
 
 export async function initApp(): Promise<void> {
   try {
-    // Release any stale lock and close open log entries left by a previous
-    // process that was killed mid-sync (container restart, OOM, etc.)
+    await migrateToMultiOrg()
+    await ensureSyncLockRows()
+  } catch (err) {
+    console.error('[startup] Migration failed:', (err as Error).message)
+  }
+
+  try {
+    // Release any stale locks left by a process killed mid-sync (works on
+    // both legacy single-row and new per-org sync_lock shapes).
     await pool.query(
       `UPDATE sfdb.sync_lock
        SET locked = false, locked_at = NULL, job_type = NULL
-       WHERE id = 1 AND locked = true`
+       WHERE locked = true`
     )
     await pool.query(
       `UPDATE sfdb.sync_log
@@ -156,17 +163,5 @@ export async function initApp(): Promise<void> {
     console.warn('[startup] Could not clear stale sync state:', (err as Error).message)
   }
 
-  try {
-    const result = await pool.query<{ value: string }>(
-      `SELECT value FROM sfdb.app_config WHERE key = 'active_org_alias'`
-    )
-    const orgAlias = result.rows[0]?.value
-    if (orgAlias) {
-      console.log(`[startup] Starting scheduler for org: ${orgAlias}`)
-      startScheduler(orgAlias)
-    }
-  } catch (err) {
-    // DB may not be ready yet on first boot — not fatal
-    console.warn('[startup] Could not read active org alias from app_config:', (err as Error).message)
-  }
+  // Per-org scheduler is wired up in a subsequent commit.
 }
