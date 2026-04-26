@@ -1,5 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { isSfCliMounted, listOrgs, getOrgToken } from '../auth/sfAuth'
+import { tokenForOrg } from '../auth/tokenLookup'
 import { pool } from '../db/pool'
 import { schemaForOrg, createOrgSchema, dropOrgSchema } from '../sync/ddlManager'
 
@@ -263,8 +264,7 @@ router.get('/status', async (_req: Request, res: Response, next: NextFunction) =
     }
 
     try {
-      const authKey = org.alias ?? org.username
-      const token = await getOrgToken(authKey)
+      const token = await tokenForOrg(org.alias, org.username)
       res.json({
         configured: true,
         orgId: org.org_id,

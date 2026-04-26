@@ -211,6 +211,13 @@ export async function getOrgToken(aliasOrUsername: string): Promise<SfToken> {
     exportedAt: string
   }
 
+  function tokenError(message: string): Error {
+    // Tagged so the global error handler can return a 401 + SF_SESSION_EXPIRED
+    // code, which makes the UI's SessionExpiredBanner appear with the
+    // copy-the-command + reload affordance.
+    return Object.assign(new Error(message), { sfAuthMissing: true })
+  }
+
   let tokenMap: Record<string, TokenEntry>
   try {
     const raw = await fs.readFile(tokensPath, 'utf-8')
@@ -218,24 +225,24 @@ export async function getOrgToken(aliasOrUsername: string): Promise<SfToken> {
   } catch (err) {
     const isNotFound = (err as NodeJS.ErrnoException).code === 'ENOENT'
     if (isNotFound) {
-      throw new Error(
+      throw tokenError(
         `sfAuth: data/tokens.json not found. ` +
           `Run on the host: npm run export-tokens`
       )
     }
-    throw new Error(`sfAuth: could not read data/tokens.json: ${(err as Error).message}`)
+    throw tokenError(`sfAuth: could not read data/tokens.json: ${(err as Error).message}`)
   }
 
   const entry = tokenMap[aliasOrUsername]
   if (!entry) {
-    throw new Error(
+    throw tokenError(
       `sfAuth: org "${aliasOrUsername}" not found in data/tokens.json. ` +
           `Run: npm run export-tokens`
     )
   }
 
   if (!isNonEmptyString(entry.accessToken)) {
-    throw new Error(
+    throw tokenError(
       `sfAuth: empty access token for "${aliasOrUsername}". ` +
           `Re-run: npm run export-tokens`
     )

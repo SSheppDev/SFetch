@@ -114,12 +114,22 @@ export function createApp() {
     console.error('[API error]', err)
 
     if (err instanceof Error) {
-      const anyErr = err as Error & { status?: number; errorCode?: string }
+      const anyErr = err as Error & {
+        status?: number
+        errorCode?: string
+        sfAuthMissing?: boolean
+      }
       const isSfSessionExpired =
         anyErr.errorCode === 'INVALID_SESSION_ID' ||
         /INVALID_SESSION_ID|Session expired or invalid/i.test(err.message)
-      if (isSfSessionExpired) {
-        res.status(401).json({ error: 'Salesforce session expired', code: 'SF_SESSION_EXPIRED' })
+      if (isSfSessionExpired || anyErr.sfAuthMissing === true) {
+        res.status(401).json({
+          error: anyErr.sfAuthMissing
+            ? 'Salesforce tokens missing or stale'
+            : 'Salesforce session expired',
+          details: err.message,
+          code: 'SF_SESSION_EXPIRED',
+        })
         return
       }
       const status = anyErr.status ?? 500

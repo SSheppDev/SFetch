@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { Connection } from 'jsforce'
 import { pool } from '../db/pool'
-import { getOrgToken } from '../auth/sfAuth'
+import { tokenForOrg } from '../auth/tokenLookup'
 import * as ddlManager from '../sync/ddlManager'
 import { requireOrgId, readOrg } from './_orgContext'
 
@@ -16,8 +16,7 @@ async function getConnectionForOrg(orgId: string): Promise<Connection> {
   if (!org) {
     throw Object.assign(new Error(`Org "${orgId}" is not registered`), { status: 400 })
   }
-  const authKey = org.alias ?? org.username
-  const { accessToken, instanceUrl } = await getOrgToken(authKey)
+  const { accessToken, instanceUrl } = await tokenForOrg(org.alias, org.username)
   return new Connection({ accessToken, instanceUrl, version: '59.0' })
 }
 

@@ -1,4 +1,4 @@
-import { getOrgToken } from '../auth/sfAuth'
+import { tokenForOrg } from '../auth/tokenLookup'
 import { createBulkClient } from '../salesforce/bulkClient'
 import { pool } from '../db/pool'
 import { writeSyncLog, updateSyncProgress } from './deltaSync'
@@ -31,14 +31,14 @@ const DELETE_BATCH_SIZE = 1_000
 // Helpers
 // ---------------------------------------------------------------------------
 
-async function resolveOrgAuthKey(orgId: string): Promise<string> {
+async function resolveOrgToken(orgId: string) {
   const result = await pool.query<OrgRow>(
     `SELECT alias, username FROM sfdb.orgs WHERE org_id = $1`,
     [orgId]
   )
   const row = result.rows[0]
   if (!row) throw new Error(`runReconciliation: org "${orgId}" is not registered`)
-  return row.alias ?? row.username
+  return tokenForOrg(row.alias, row.username)
 }
 
 async function startSyncLog(orgId: string, objectApiName: string): Promise<number> {
@@ -71,8 +71,7 @@ async function tableExists(orgId: string, objectApiName: string): Promise<boolea
 // ---------------------------------------------------------------------------
 
 export async function runReconciliation(orgId: string, targetObject?: string): Promise<void> {
-  const authKey = await resolveOrgAuthKey(orgId)
-  const token = await getOrgToken(authKey)
+  const token = await resolveOrgToken(orgId)
   const bulkClient = createBulkClient({
     accessToken: token.accessToken,
     instanceUrl: token.instanceUrl,
