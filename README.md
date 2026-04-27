@@ -31,20 +31,25 @@ A self-hosted Salesforce-to-PostgreSQL sync pipeline. Run it with `docker compos
 # 1. Authenticate a Salesforce org (skip if already done)
 sf org login web --alias my-org
 
-# 2. Configure environment
+# 2. Export decrypted Salesforce tokens for Docker to use
+npm run export-tokens
+
+# 3. Configure environment
 cp .env.example .env
 # Edit .env — set POSTGRES_PASSWORD at minimum
 
-# 3. Start
+# 4. Start
 docker compose up -d
 
-# 4. Open the UI
+# 5. Open the UI
 open http://localhost:7743
 ```
 
 First start takes ~30 seconds while Postgres initializes and the API container builds.
 
 The onboarding screen will detect your authenticated orgs and ask you to pick one. After that, go to the Objects page and enable the Salesforce objects you want to sync.
+
+`npm run export-tokens` writes plaintext access tokens to `data/tokens.json` so the Docker container can authenticate to Salesforce. This file is local-only secret material, is git-ignored, and should never be committed or shared.
 
 ## Connect a BI tool or SQL client
 
@@ -103,7 +108,7 @@ Queries `SELECT Id FROM <Object>` for the full live ID set, diffs against local 
 
 ### Concurrency
 
-Only one sync runs at a time. A single-row lock table (`sfdb.sync_lock`) prevents overlap. Stale locks (> 30 min) are automatically reclaimed on startup.
+Sync is serialized per org via `sfdb.sync_lock`, with one lock row per registered org. Different orgs can sync in parallel; overlapping syncs for the same org are blocked. Stale locks (> 30 min) are automatically reclaimed on startup.
 
 ## Database schema
 

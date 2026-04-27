@@ -90,7 +90,6 @@ export interface ConnectionDetails {
   port: number
   database: string
   user: string
-  password: string
   connectionString: string
 }
 

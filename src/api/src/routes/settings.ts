@@ -34,20 +34,17 @@ router.get('/', async (_req: Request, res: Response, next: NextFunction) => {
 
 router.get('/connection', (_req: Request, res: Response, next: NextFunction) => {
   try {
-    const host = process.env.POSTGRES_HOST ?? 'localhost'
+    const host = 'localhost'
     const port = process.env.POSTGRES_PORT ?? '7745'
     const database = process.env.POSTGRES_DB ?? 'sfdb'
     const user = process.env.POSTGRES_USER ?? 'sfdb'
-    const password = process.env.POSTGRES_PASSWORD ?? 'changeme'
-
-    const connectionString = `postgresql://${user}:${password}@${host}:${port}/${database}`
+    const connectionString = `postgresql://${user}@${host}:${port}/${database}`
 
     res.json({
       host,
       port,
       database,
       user,
-      password,
       connectionString,
     })
   } catch (err) {

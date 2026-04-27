@@ -13,9 +13,14 @@ if [ -z "$READONLY_PASSWORD" ]; then
   exit 0
 fi
 
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
-  CREATE ROLE sfdb_readonly WITH LOGIN PASSWORD '$READONLY_PASSWORD';
-  GRANT CONNECT ON DATABASE $POSTGRES_DB TO sfdb_readonly;
+psql \
+  -v ON_ERROR_STOP=1 \
+  -v readonly_password="$READONLY_PASSWORD" \
+  -v db_name="$POSTGRES_DB" \
+  --username "$POSTGRES_USER" \
+  --dbname "$POSTGRES_DB" <<-EOSQL
+  CREATE ROLE sfdb_readonly WITH LOGIN PASSWORD :'readonly_password';
+  GRANT CONNECT ON DATABASE :"db_name" TO sfdb_readonly;
 EOSQL
 
 echo "Read-only user 'sfdb_readonly' created. Per-schema grants are issued by the API on org registration."

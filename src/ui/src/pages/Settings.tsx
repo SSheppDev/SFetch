@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Eye, EyeOff, Copy, Check, Loader2, RefreshCw, Plus, Trash2 } from 'lucide-react'
+import { Copy, Check, Loader2, RefreshCw, Plus, Trash2 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { useOrg } from '@/lib/orgContext'
 import { formatBytes } from '@/lib/format'
@@ -23,7 +23,6 @@ export default function SettingsPage() {
   const { orgs, activeOrg, refresh: refreshOrgs, setActiveOrgId } = useOrg()
 
   const [connection, setConnection] = useState<ConnectionDetails | null>(null)
-  const [showPassword, setShowPassword] = useState(false)
   const [copied, setCopied] = useState(false)
   const [stats, setStats] = useState<DbStats | null>(null)
   const [statsLoading, setStatsLoading] = useState(true)
@@ -261,28 +260,13 @@ export default function SettingsPage() {
                 </div>
                 <div className="col-span-2">
                   <p className="text-xs text-[var(--color-muted-foreground)] mb-0.5">Password</p>
-                  <div className="flex items-center gap-2">
-                    <p className="font-mono text-xs tracking-wider">
-                      {showPassword
-                        ? connection.password
-                        : '•'.repeat(Math.min(connection.password.length, 12))}
-                    </p>
-                    <button
-                      onClick={() => setShowPassword((v) => !v)}
-                      className="text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)] transition-colors"
-                      aria-label={showPassword ? 'Hide password' : 'Show password'}
-                    >
-                      {showPassword ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                    </button>
-                  </div>
+                  <p className="font-mono text-xs">Use `POSTGRES_PASSWORD` from your local `.env` file.</p>
                 </div>
               </div>
 
               <div className="rounded-md bg-[var(--color-muted)] px-3 py-2 flex items-center justify-between gap-3">
                 <p className="font-mono text-xs text-[var(--color-foreground)] truncate">
-                  {showPassword
-                    ? connection.connectionString
-                    : connection.connectionString.replace(/:([^@]+)@/, ':' + '•'.repeat(8) + '@')}
+                  {connection.connectionString}
                 </p>
                 <button
                   onClick={handleCopyConnectionString}
@@ -298,9 +282,10 @@ export default function SettingsPage() {
               </div>
 
               <p className="text-xs text-[var(--color-muted-foreground)]">
-                Connect your BI tool or SQL client using these details. Each registered org has its
-                own schema named <code className="font-mono">org_&lt;orgid&gt;</code>; pick the schema for
-                the org you want to query.
+                Connect your BI tool or SQL client using these details. Supply the password from
+                your local <code className="font-mono">.env</code> file. Each registered org has its own
+                schema named <code className="font-mono">org_&lt;orgid&gt;</code>; pick the schema for the org
+                you want to query.
               </p>
             </>
           ) : (
