@@ -4,7 +4,11 @@ import helmet from 'helmet'
 import rateLimit from 'express-rate-limit'
 import path from 'path'
 import { pool } from './db/pool'
-import { migrateToMultiOrg, ensureSyncLockRows } from './db/migrate'
+import {
+  migrateToMultiOrg,
+  ensureOrgObjectPrimaryKeys,
+  ensureSyncLockRows,
+} from './db/migrate'
 import { startScheduler } from './sync/scheduler'
 
 // ---------------------------------------------------------------------------
@@ -150,6 +154,7 @@ export async function initApp(): Promise<void> {
   try {
     await migrateToMultiOrg()
     await ensureSyncLockRows()
+    await ensureOrgObjectPrimaryKeys()
   } catch (err) {
     console.error('[startup] Migration failed:', (err as Error).message)
   }

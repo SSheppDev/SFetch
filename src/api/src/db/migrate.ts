@@ -54,6 +54,10 @@ async function schemaExists(schema: string): Promise<boolean> {
   return result.rows[0]?.exists ?? false
 }
 
+function quoteIdent(name: string): string {
+  return `"${name.replace(/"/g, '""')}"`
+}
+
 async function readonlyRoleExists(): Promise<boolean> {
   const result = await pool.query<{ exists: boolean }>(
     `SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sfdb_readonly') AS exists`
@@ -331,4 +335,156 @@ export async function ensureSyncLockRows(): Promise<void> {
     SELECT org_id FROM sfdb.orgs
     ON CONFLICT (org_id) DO NOTHING
   `)
+}
+
+interface OrgSchemaRow {
+  org_id: string
+  schema_name: string
+}
+
+interface ObjectTableRow {
+  table_name: string
+}
+
+interface DuplicateIdRow {
+  id: string | null
+  duplicate_count: string
+}
+
+async function tableHasPrimaryKeyOnId(
+  schema: string,
+  table: string
+): Promise<boolean> {
+  const result = await pool.query<{ exists: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1
+       FROM pg_constraint c
+       JOIN pg_class cls
+         ON cls.oid = c.conrelid
+       JOIN pg_namespace n
+         ON n.oid = cls.relnamespace
+       JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS cols(attnum, ord)
+         ON true
+       JOIN pg_attribute a
+         ON a.attrelid = cls.oid
+        AND a.attnum = cols.attnum
+       WHERE c.contype = 'p'
+         AND n.nspname = $1
+         AND cls.relname = $2
+       GROUP BY c.oid
+       HAVING COUNT(*) = 1
+          AND BOOL_AND(a.attname = 'id')
+     ) AS exists`,
+    [schema, table]
+  )
+  return result.rows[0]?.exists ?? false
+}
+
+async function tableHasUniqueConstraintOnId(
+  schema: string,
+  table: string
+): Promise<boolean> {
+  const result = await pool.query<{ exists: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1
+       FROM pg_index idx
+       JOIN pg_class cls
+         ON cls.oid = idx.indrelid
+       JOIN pg_namespace n
+         ON n.oid = cls.relnamespace
+       JOIN LATERAL unnest(idx.indkey) WITH ORDINALITY AS cols(attnum, ord)
+         ON true
+       JOIN pg_attribute a
+         ON a.attrelid = cls.oid
+        AND a.attnum = cols.attnum
+       WHERE idx.indisunique
+         AND n.nspname = $1
+         AND cls.relname = $2
+       GROUP BY idx.indexrelid
+       HAVING COUNT(*) = 1
+          AND BOOL_AND(a.attname = 'id')
+     ) AS exists`,
+    [schema, table]
+  )
+  return result.rows[0]?.exists ?? false
+}
+
+async function findDuplicateIds(
+  schema: string,
+  table: string
+): Promise<DuplicateIdRow[]> {
+  const tableRef = `${quoteIdent(schema)}.${quoteIdent(table)}`
+  const result = await pool.query<DuplicateIdRow>(
+    `SELECT id, COUNT(*)::text AS duplicate_count
+     FROM ${tableRef}
+     GROUP BY id
+     HAVING id IS NULL OR COUNT(*) > 1
+     ORDER BY COUNT(*) DESC, id NULLS FIRST
+     LIMIT 5`
+  )
+  return result.rows
+}
+
+async function ensurePrimaryKeyOnId(schema: string, table: string): Promise<void> {
+  const hasPrimaryKey = await tableHasPrimaryKeyOnId(schema, table)
+  if (hasPrimaryKey) return
+
+  const hasUniqueConstraint = await tableHasUniqueConstraintOnId(schema, table)
+  if (hasUniqueConstraint) return
+
+  if (!(await columnExists(schema, table, 'id'))) {
+    throw new Error(
+      `[migrate] Cannot repair ${schema}.${table}: missing required "id" column`
+    )
+  }
+
+  const duplicates = await findDuplicateIds(schema, table)
+  if (duplicates.length > 0) {
+    const sample = duplicates
+      .map((row) =>
+        row.id === null
+          ? `id=NULL (${row.duplicate_count} rows)`
+          : `id=${row.id} (${row.duplicate_count} rows)`
+      )
+      .join(', ')
+    throw new Error(
+      `[migrate] Cannot add primary key to ${schema}.${table}: duplicate/null ids found (${sample})`
+    )
+  }
+
+  await pool.query(
+    `ALTER TABLE ${quoteIdent(schema)}.${quoteIdent(table)} ALTER COLUMN id SET NOT NULL`
+  )
+  await pool.query(
+    `ALTER TABLE ${quoteIdent(schema)}.${quoteIdent(table)}
+     ADD CONSTRAINT ${quoteIdent(`${table}_pkey`)} PRIMARY KEY (id)`
+  )
+  console.log(`[migrate] Added missing PRIMARY KEY (id) on ${schema}.${table}`)
+}
+
+export async function ensureOrgObjectPrimaryKeys(): Promise<void> {
+  if (!(await tableExists('sfdb', 'orgs'))) return
+
+  const orgResult = await pool.query<OrgSchemaRow>(
+    `SELECT org_id, schema_name
+     FROM sfdb.orgs
+     ORDER BY added_at ASC, org_id ASC`
+  )
+
+  for (const org of orgResult.rows) {
+    if (!(await schemaExists(org.schema_name))) continue
+
+    const tableResult = await pool.query<ObjectTableRow>(
+      `SELECT table_name
+       FROM information_schema.tables
+       WHERE table_schema = $1
+         AND table_type = 'BASE TABLE'
+       ORDER BY table_name ASC`,
+      [org.schema_name]
+    )
+
+    for (const table of tableResult.rows) {
+      await ensurePrimaryKeyOnId(org.schema_name, table.table_name)
+    }
+  }
 }
