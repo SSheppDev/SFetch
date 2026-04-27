@@ -1,6 +1,8 @@
 #!/bin/bash
 # 004_readonly_user.sh
-# Creates a read-only role scoped to the salesforce schema.
+# Creates a read-only role that the API will later grant per-org-schema
+# privileges to as orgs are registered. Per-schema grants happen at runtime
+# in the API (see ddlManager.createOrgSchema).
 # Runs once on first Postgres container start via docker-entrypoint-initdb.d.
 # Requires READONLY_PASSWORD env var to be set.
 
@@ -11,16 +13,14 @@ if [ -z "$READONLY_PASSWORD" ]; then
   exit 0
 fi
 
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
-  CREATE ROLE sfdb_readonly WITH LOGIN PASSWORD '$READONLY_PASSWORD';
-
-  GRANT CONNECT ON DATABASE $POSTGRES_DB TO sfdb_readonly;
-  GRANT USAGE ON SCHEMA salesforce TO sfdb_readonly;
-  GRANT SELECT ON ALL TABLES IN SCHEMA salesforce TO sfdb_readonly;
-
-  -- auto-grant SELECT on tables created in the future
-  ALTER DEFAULT PRIVILEGES IN SCHEMA salesforce
-    GRANT SELECT ON TABLES TO sfdb_readonly;
+psql \
+  -v ON_ERROR_STOP=1 \
+  -v readonly_password="$READONLY_PASSWORD" \
+  -v db_name="$POSTGRES_DB" \
+  --username "$POSTGRES_USER" \
+  --dbname "$POSTGRES_DB" <<-EOSQL
+  CREATE ROLE sfdb_readonly WITH LOGIN PASSWORD :'readonly_password';
+  GRANT CONNECT ON DATABASE :"db_name" TO sfdb_readonly;
 EOSQL
 
-echo "Read-only user 'sfdb_readonly' created."
+echo "Read-only user 'sfdb_readonly' created. Per-schema grants are issued by the API on org registration."

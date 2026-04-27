@@ -1,12 +1,8 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { pool } from '../db/pool'
+import { requireOrgId } from './_orgContext'
 
 const router = Router()
-
-// ---------------------------------------------------------------------------
-// GET /api/logs
-// Query sync logs with optional filters
-// ---------------------------------------------------------------------------
 
 interface LogEntry {
   id: number
@@ -21,6 +17,9 @@ interface LogEntry {
 
 router.get('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const orgId = await requireOrgId(req, res)
+    if (!orgId) return
+
     const {
       object: objectFilter,
       syncType: syncTypeFilter,
@@ -32,9 +31,8 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
     const limit = Math.min(parseInt(limitParam ?? '100', 10) || 100, 500)
     const offset = parseInt(offsetParam ?? '0', 10) || 0
 
-    // Build dynamic WHERE clauses
-    const conditions: string[] = []
-    const params: unknown[] = []
+    const conditions: string[] = ['org_id = $1']
+    const params: unknown[] = [orgId]
 
     if (objectFilter) {
       params.push(objectFilter)
@@ -52,16 +50,14 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
       conditions.push(`error IS NULL AND completed_at IS NOT NULL`)
     }
 
-    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+    const whereClause = `WHERE ${conditions.join(' AND ')}`
 
-    // Get total count
     const countResult = await pool.query<{ count: string }>(
       `SELECT COUNT(*) AS count FROM sfdb.sync_log ${whereClause}`,
       params
     )
     const total = parseInt(countResult.rows[0]?.count ?? '0', 10)
 
-    // Get paginated rows
     const dataParams = [...params, limit, offset]
     const dataResult = await pool.query<{
       id: number

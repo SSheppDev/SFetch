@@ -29,7 +29,7 @@ export function SessionExpiredBanner() {
   return (
     <div className="fixed top-0 left-0 right-0 z-50 bg-amber-500 text-black px-4 py-3 shadow-md flex items-center justify-between gap-4">
       <div className="text-sm flex items-center gap-2 flex-wrap">
-        <strong>Salesforce session expired.</strong>
+        <strong>Salesforce tokens need refresh.</strong>
         <span>Run this in your sfetch directory, then reload:</span>
         <code
           className="px-2 py-0.5 bg-black/15 rounded font-mono text-xs cursor-pointer hover:bg-black/25"

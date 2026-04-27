@@ -17,7 +17,15 @@ Verify it worked:
 sf org list
 ```
 
-## 2. Configure environment
+## 2. Export decrypted Salesforce tokens for Docker
+
+```bash
+npm run export-tokens
+```
+
+This writes `data/tokens.json`, a local-only secret file consumed by the API container. It is git-ignored and should never be committed.
+
+## 3. Configure environment
 
 ```bash
 cp .env.example .env
@@ -27,7 +35,7 @@ Edit `.env` if you need to change ports or the DB password. Defaults:
 - UI + API: `http://localhost:7743`
 - PostgreSQL: `localhost:7745`
 
-## 3. Start the app
+## 4. Start the app
 
 ```bash
 docker compose up -d
@@ -41,7 +49,7 @@ docker compose ps
 docker compose logs -f api
 ```
 
-## 4. Open the UI
+## 5. Open the UI
 
 ```
 http://localhost:7743
@@ -49,7 +57,7 @@ http://localhost:7743
 
 The onboarding screen will detect your authenticated orgs and ask you to pick one.
 
-## 5. Connect your BI tool / SQL client
+## 6. Connect your BI tool / SQL client
 
 Once data is syncing, connect directly to Postgres:
 
@@ -58,9 +66,9 @@ Once data is syncing, connect directly to Postgres:
 | Host | `localhost` |
 | Port | `7745` (or `$POSTGRES_PORT` from `.env`) |
 | Database | `sfdb` |
-| Schema | `salesforce` |
+| Schema | `org_<orgid>` |
 | User | `sfdb` (or `$POSTGRES_USER`) |
-| Password | `changeme` (or `$POSTGRES_PASSWORD`) |
+| Password | your `.env` `POSTGRES_PASSWORD` value |
 
 The Settings page in the UI shows a copyable connection string.
 

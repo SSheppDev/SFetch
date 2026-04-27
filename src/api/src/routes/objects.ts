@@ -1,24 +1,22 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { Connection } from 'jsforce'
 import { pool } from '../db/pool'
-import { getOrgToken } from '../auth/sfAuth'
+import { tokenForOrg } from '../auth/tokenLookup'
 import * as ddlManager from '../sync/ddlManager'
+import { requireOrgId, readOrg } from './_orgContext'
 
 const router = Router()
 
 // ---------------------------------------------------------------------------
-// Helper — create a jsforce Connection for the active org
+// Helper — create a jsforce Connection for the given org
 // ---------------------------------------------------------------------------
 
-async function getConnection(): Promise<Connection> {
-  const result = await pool.query<{ value: string }>(
-    `SELECT value FROM sfdb.app_config WHERE key = 'active_org_alias'`
-  )
-  const alias = result.rows[0]?.value
-  if (!alias) {
-    throw Object.assign(new Error('No active org configured'), { status: 400 })
+async function getConnectionForOrg(orgId: string): Promise<Connection> {
+  const org = await readOrg(orgId)
+  if (!org) {
+    throw Object.assign(new Error(`Org "${orgId}" is not registered`), { status: 400 })
   }
-  const { accessToken, instanceUrl } = await getOrgToken(alias)
+  const { accessToken, instanceUrl } = await tokenForOrg(org.alias, org.username)
   return new Connection({ accessToken, instanceUrl, version: '59.0' })
 }
 
@@ -29,7 +27,6 @@ async function getConnection(): Promise<Connection> {
 const SF_SYSTEM_FIELDS = new Set(['Id', 'CreatedDate', 'SystemModstamp', 'IsDeleted'])
 
 // Compound field types cannot be queried via Bulk API 2.0.
-// Their component fields (BillingStreet, BillingCity, etc.) are included individually.
 const SF_COMPOUND_TYPES = new Set(['address', 'location'])
 
 // ---------------------------------------------------------------------------
@@ -45,34 +42,34 @@ interface SyncConfigRow {
 
 // ---------------------------------------------------------------------------
 // GET /api/objects
-// List all queryable+createable sObjects with sync status and row counts
 // ---------------------------------------------------------------------------
 
-router.get('/', async (_req: Request, res: Response, next: NextFunction) => {
+router.get('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const conn = await getConnection()
+    const orgId = await requireOrgId(req, res)
+    if (!orgId) return
+
+    const conn = await getConnectionForOrg(orgId)
     const globalDesc = await conn.describeGlobal()
 
-    // Filter to queryable + createable sObjects
     const filteredSObjects = globalDesc.sobjects.filter(
       (obj) => obj.queryable && obj.createable
     )
 
-    // Load sync_config rows for all objects
     const syncConfigResult = await pool.query<SyncConfigRow>(
       `SELECT object_api_name, enabled, last_delta_sync, last_full_sync
-       FROM sfdb.sync_config`
+       FROM sfdb.sync_config WHERE org_id = $1`,
+      [orgId]
     )
     const syncConfigMap = new Map<string, SyncConfigRow>()
     for (const row of syncConfigResult.rows) {
       syncConfigMap.set(row.object_api_name, row)
     }
 
-    // Build result array
     const objects = await Promise.all(
       filteredSObjects.map(async (obj) => {
         const syncConfig = syncConfigMap.get(obj.name) ?? null
-        const rowCount = await ddlManager.getTableRowCount(obj.name)
+        const rowCount = await ddlManager.getTableRowCount(orgId, obj.name)
 
         return {
           apiName: obj.name,
@@ -85,7 +82,6 @@ router.get('/', async (_req: Request, res: Response, next: NextFunction) => {
       })
     )
 
-    // Sort by label
     objects.sort((a, b) => a.label.localeCompare(b.label))
 
     res.json(objects)
@@ -96,11 +92,13 @@ router.get('/', async (_req: Request, res: Response, next: NextFunction) => {
 
 // ---------------------------------------------------------------------------
 // PATCH /api/objects/:name
-// Enable or disable sync for an object; optionally drop its table
 // ---------------------------------------------------------------------------
 
 router.patch('/:name', async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const orgId = await requireOrgId(req, res)
+    if (!orgId) return
+
     const { name } = req.params
     const body = req.body as { enabled?: unknown; dropTable?: unknown }
 
@@ -113,60 +111,56 @@ router.patch('/:name', async (req: Request, res: Response, next: NextFunction) =
     const dropTableFlag = body.dropTable === true
 
     if (enabled) {
-      // Describe the object fields via jsforce first so we can detect capabilities
-      const conn = await getConnection()
+      const conn = await getConnectionForOrg(orgId)
       const desc = await conn.sobject(name).describe()
 
       const fieldNames = new Set(desc.fields.map((f) => f.name))
       const hasSystemModstamp = fieldNames.has('SystemModstamp')
       const hasCreatedDate    = fieldNames.has('CreatedDate')
 
-      // Upsert sync_config with enabled = true and detected audit capabilities
       await pool.query(
-        `INSERT INTO sfdb.sync_config (object_api_name, enabled, has_system_modstamp, has_created_date)
-         VALUES ($1, true, $2, $3)
-         ON CONFLICT (object_api_name) DO UPDATE
-           SET enabled = true, has_system_modstamp = $2, has_created_date = $3`,
-        [name, hasSystemModstamp, hasCreatedDate]
+        `INSERT INTO sfdb.sync_config (org_id, object_api_name, enabled, has_system_modstamp, has_created_date)
+         VALUES ($1, $2, true, $3, $4)
+         ON CONFLICT (org_id, object_api_name) DO UPDATE
+           SET enabled = true, has_system_modstamp = $3, has_created_date = $4`,
+        [orgId, name, hasSystemModstamp, hasCreatedDate]
       )
 
-      // Upsert all fields into field_config and field_metadata (skip system and compound fields)
       for (const field of desc.fields) {
         if (SF_SYSTEM_FIELDS.has(field.name)) continue
         if (SF_COMPOUND_TYPES.has((field.type as string).toLowerCase())) continue
         const pgType = ddlManager.sfTypeToPg(field.type as string)
 
         await pool.query(
-          `INSERT INTO sfdb.field_config (object_api_name, field_api_name, pg_column_name, enabled)
-           VALUES ($1, $2, $3, true)
-           ON CONFLICT (object_api_name, field_api_name) DO NOTHING`,
-          [name, field.name, field.name.toLowerCase()]
+          `INSERT INTO sfdb.field_config (org_id, object_api_name, field_api_name, pg_column_name, enabled)
+           VALUES ($1, $2, $3, $4, true)
+           ON CONFLICT (org_id, object_api_name, field_api_name) DO NOTHING`,
+          [orgId, name, field.name, field.name.toLowerCase()]
         )
 
         await pool.query(
-          `INSERT INTO sfdb.field_metadata (object_api_name, field_api_name, label, sf_type, pg_type, nullable, cached_at)
-           VALUES ($1, $2, $3, $4, $5, $6, NOW())
-           ON CONFLICT (object_api_name, field_api_name) DO UPDATE
-             SET label = $3, sf_type = $4, pg_type = $5, nullable = $6, cached_at = NOW()`,
-          [name, field.name, field.label, field.type, pgType, field.nillable]
+          `INSERT INTO sfdb.field_metadata (org_id, object_api_name, field_api_name, label, sf_type, pg_type, nullable, cached_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+           ON CONFLICT (org_id, object_api_name, field_api_name) DO UPDATE
+             SET label = $4, sf_type = $5, pg_type = $6, nullable = $7, cached_at = NOW()`,
+          [orgId, name, field.name, field.label, field.type, pgType, field.nillable]
         )
       }
 
-      // Create PG table via DDL manager (skip system and compound fields)
       const enabledFields = desc.fields
         .filter((f) => !SF_SYSTEM_FIELDS.has(f.name) && !SF_COMPOUND_TYPES.has((f.type as string).toLowerCase()))
         .map((f) => ({ apiName: f.name, sfType: f.type as string }))
 
-      await ddlManager.createObjectTable(name, enabledFields)
+      await ddlManager.createObjectTable(orgId, name, enabledFields)
     } else {
-      // Disable sync
       await pool.query(
-        `UPDATE sfdb.sync_config SET enabled = false WHERE object_api_name = $1`,
-        [name]
+        `UPDATE sfdb.sync_config SET enabled = false
+         WHERE org_id = $1 AND object_api_name = $2`,
+        [orgId, name]
       )
 
       if (dropTableFlag) {
-        await ddlManager.dropTable(name)
+        await ddlManager.dropTable(orgId, name)
       }
     }
 
@@ -178,36 +172,38 @@ router.patch('/:name', async (req: Request, res: Response, next: NextFunction) =
 
 // ---------------------------------------------------------------------------
 // GET /api/objects/:name/fields
-// List fields for an object with enabled state and type info
 // ---------------------------------------------------------------------------
 
 router.get('/:name/fields', async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const orgId = await requireOrgId(req, res)
+    if (!orgId) return
+
     const { name } = req.params
 
-    const conn = await getConnection()
+    const conn = await getConnectionForOrg(orgId)
     const desc = await conn.sobject(name).describe()
 
-    // Load field_config rows for this object
     const fieldConfigResult = await pool.query<{
       field_api_name: string
       enabled: boolean
     }>(
-      `SELECT field_api_name, enabled FROM sfdb.field_config WHERE object_api_name = $1`,
-      [name]
+      `SELECT field_api_name, enabled FROM sfdb.field_config
+       WHERE org_id = $1 AND object_api_name = $2`,
+      [orgId, name]
     )
     const fieldConfigMap = new Map<string, boolean>()
     for (const row of fieldConfigResult.rows) {
       fieldConfigMap.set(row.field_api_name, row.enabled)
     }
 
-    // Load cached pg_type from field_metadata
     const metaResult = await pool.query<{
       field_api_name: string
       pg_type: string
     }>(
-      `SELECT field_api_name, pg_type FROM sfdb.field_metadata WHERE object_api_name = $1`,
-      [name]
+      `SELECT field_api_name, pg_type FROM sfdb.field_metadata
+       WHERE org_id = $1 AND object_api_name = $2`,
+      [orgId, name]
     )
     const pgTypeMap = new Map<string, string>()
     for (const row of metaResult.rows) {
@@ -231,11 +227,13 @@ router.get('/:name/fields', async (req: Request, res: Response, next: NextFuncti
 
 // ---------------------------------------------------------------------------
 // PATCH /api/objects/:name/fields/:field
-// Enable or disable a specific field
 // ---------------------------------------------------------------------------
 
 router.patch('/:name/fields/:field', async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const orgId = await requireOrgId(req, res)
+    if (!orgId) return
+
     const { name, field } = req.params
     const body = req.body as { enabled?: unknown }
 
@@ -246,25 +244,22 @@ router.patch('/:name/fields/:field', async (req: Request, res: Response, next: N
 
     const enabled: boolean = body.enabled
 
-    // Update field_config
     await pool.query(
       `UPDATE sfdb.field_config SET enabled = $1
-       WHERE object_api_name = $2 AND field_api_name = $3`,
-      [enabled, name, field]
+       WHERE org_id = $2 AND object_api_name = $3 AND field_api_name = $4`,
+      [enabled, orgId, name, field]
     )
 
     if (!enabled) {
-      // Drop column from PG table
-      await ddlManager.dropColumn(name, field)
+      await ddlManager.dropColumn(orgId, name, field)
     } else {
-      // Re-enable: look up sfType from field_metadata and add column
       const metaResult = await pool.query<{ sf_type: string }>(
         `SELECT sf_type FROM sfdb.field_metadata
-         WHERE object_api_name = $1 AND field_api_name = $2`,
-        [name, field]
+         WHERE org_id = $1 AND object_api_name = $2 AND field_api_name = $3`,
+        [orgId, name, field]
       )
       const sfType = metaResult.rows[0]?.sf_type ?? 'string'
-      await ddlManager.addColumn(name, field, sfType)
+      await ddlManager.addColumn(orgId, name, field, sfType)
     }
 
     res.json({ ok: true })

@@ -1,7 +1,8 @@
-import { getOrgToken } from '../auth/sfAuth'
+import { tokenForOrg } from '../auth/tokenLookup'
 import { createBulkClient } from '../salesforce/bulkClient'
 import { pool } from '../db/pool'
 import { writeSyncLog, updateSyncProgress } from './deltaSync'
+import { schemaForOrg, tableRefForOrg } from './ddlManager'
 
 // ---------------------------------------------------------------------------
 // Internal types
@@ -15,6 +16,11 @@ interface LocalIdRow {
   id: string
 }
 
+interface OrgRow {
+  alias: string | null
+  username: string
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -25,27 +31,37 @@ const DELETE_BATCH_SIZE = 1_000
 // Helpers
 // ---------------------------------------------------------------------------
 
-async function startSyncLog(objectApiName: string): Promise<number> {
+async function resolveOrgToken(orgId: string) {
+  const result = await pool.query<OrgRow>(
+    `SELECT alias, username FROM sfdb.orgs WHERE org_id = $1`,
+    [orgId]
+  )
+  const row = result.rows[0]
+  if (!row) throw new Error(`runReconciliation: org "${orgId}" is not registered`)
+  return tokenForOrg(row.alias, row.username)
+}
+
+async function startSyncLog(orgId: string, objectApiName: string): Promise<number> {
   const result = await pool.query<{ id: number }>(
-    `INSERT INTO sfdb.sync_log (object_api_name, sync_type, started_at, phase)
-     VALUES ($1, 'full', NOW(), 'polling')
+    `INSERT INTO sfdb.sync_log (org_id, object_api_name, sync_type, started_at, phase)
+     VALUES ($1, $2, 'full', NOW(), 'polling')
      RETURNING id`,
-    [objectApiName]
+    [orgId, objectApiName]
   )
   return result.rows[0].id
 }
 
 /**
- * Returns true if the salesforce.<objectApiName> table exists.
+ * Returns true if the per-org table for `objectApiName` exists.
  */
-async function tableExists(objectApiName: string): Promise<boolean> {
+async function tableExists(orgId: string, objectApiName: string): Promise<boolean> {
   const result = await pool.query<{ exists: boolean }>(
     `SELECT EXISTS (
        SELECT 1 FROM information_schema.tables
-       WHERE table_schema = 'salesforce'
-         AND table_name   = $1
+       WHERE table_schema = $1
+         AND table_name   = $2
      ) AS exists`,
-    [objectApiName.toLowerCase()]
+    [schemaForOrg(orgId), objectApiName.toLowerCase()]
   )
   return result.rows[0]?.exists ?? false
 }
@@ -54,8 +70,8 @@ async function tableExists(objectApiName: string): Promise<boolean> {
 // Main export
 // ---------------------------------------------------------------------------
 
-export async function runReconciliation(orgAlias: string, targetObject?: string): Promise<void> {
-  const token = await getOrgToken(orgAlias)
+export async function runReconciliation(orgId: string, targetObject?: string): Promise<void> {
+  const token = await resolveOrgToken(orgId)
   const bulkClient = createBulkClient({
     accessToken: token.accessToken,
     instanceUrl: token.instanceUrl,
@@ -65,14 +81,15 @@ export async function runReconciliation(orgAlias: string, targetObject?: string)
     ? await pool.query<SyncConfigRow>(
         `SELECT object_api_name
          FROM sfdb.sync_config
-         WHERE enabled = true AND object_api_name = $1`,
-        [targetObject]
+         WHERE org_id = $1 AND enabled = true AND object_api_name = $2`,
+        [orgId, targetObject]
       )
     : await pool.query<SyncConfigRow>(
         `SELECT object_api_name
          FROM sfdb.sync_config
-         WHERE enabled = true
-         ORDER BY sync_order ASC, object_api_name ASC`
+         WHERE org_id = $1 AND enabled = true
+         ORDER BY sync_order ASC, object_api_name ASC`,
+        [orgId]
       )
 
   const objects = configResult.rows
@@ -82,21 +99,18 @@ export async function runReconciliation(orgAlias: string, targetObject?: string)
     let recordsDeleted = 0
 
     try {
-      // Skip if the local table doesn't exist yet
-      if (!(await tableExists(objectApiName))) {
+      if (!(await tableExists(orgId, objectApiName))) {
         console.warn(
-          `[reconciliation] Table salesforce.${objectApiName.toLowerCase()} does not exist — skipping`
+          `[reconciliation] [${orgId}] Table ${tableRefForOrg(orgId, objectApiName)} does not exist — skipping`
         )
         continue
       }
 
-      logId = await startSyncLog(objectApiName)
+      logId = await startSyncLog(orgId, objectApiName)
 
-      // 1. Bulk query all live SF ids
       const soql = `SELECT Id FROM ${objectApiName}`
       const queryResult = await bulkClient.query(soql)
 
-      // Phase: polling SF for IDs
       await updateSyncProgress(logId, 'polling', 0, queryResult.totalSize)
 
       const sfIds = new Set<string>()
@@ -107,21 +121,18 @@ export async function runReconciliation(orgAlias: string, targetObject?: string)
         }
       }
 
-      // 2. Get local live ids (sf_deleted_at IS NULL)
       await updateSyncProgress(logId, 'diffing', sfIds.size, queryResult.totalSize)
       const localResult = await pool.query<LocalIdRow>(
-        `SELECT id FROM salesforce.${objectApiName.toLowerCase()} WHERE sf_deleted_at IS NULL`
+        `SELECT id FROM ${tableRefForOrg(orgId, objectApiName)} WHERE sf_deleted_at IS NULL`
       )
       const localIds = localResult.rows.map((r) => r.id)
 
-      // 3. Diff: local ids not in SF = deleted in Salesforce
       const deletedIds = localIds.filter((id) => !sfIds.has(id))
 
-      // 4. Soft-delete in batches of 1000
       for (let i = 0; i < deletedIds.length; i += DELETE_BATCH_SIZE) {
         const batch = deletedIds.slice(i, i + DELETE_BATCH_SIZE)
         const result = await pool.query(
-          `UPDATE salesforce.${objectApiName.toLowerCase()}
+          `UPDATE ${tableRefForOrg(orgId, objectApiName)}
            SET sf_deleted_at = NOW()
            WHERE id = ANY($1)`,
           [batch]
@@ -129,16 +140,16 @@ export async function runReconciliation(orgAlias: string, targetObject?: string)
         recordsDeleted += result.rowCount ?? 0
       }
 
-      // 5. Update last_full_sync
       await pool.query(
-        `UPDATE sfdb.sync_config SET last_full_sync = NOW() WHERE object_api_name = $1`,
-        [objectApiName]
+        `UPDATE sfdb.sync_config SET last_full_sync = NOW()
+         WHERE org_id = $1 AND object_api_name = $2`,
+        [orgId, objectApiName]
       )
 
       await writeSyncLog(logId, 0, recordsDeleted)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      console.error(`[reconciliation] Error reconciling ${objectApiName}: ${message}`)
+      console.error(`[reconciliation] [${orgId}] Error reconciling ${objectApiName}: ${message}`)
       if (logId !== undefined) {
         await writeSyncLog(logId, 0, recordsDeleted, message)
       }

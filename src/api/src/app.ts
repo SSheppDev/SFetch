@@ -4,6 +4,11 @@ import helmet from 'helmet'
 import rateLimit from 'express-rate-limit'
 import path from 'path'
 import { pool } from './db/pool'
+import {
+  migrateToMultiOrg,
+  ensureOrgObjectPrimaryKeys,
+  ensureSyncLockRows,
+} from './db/migrate'
 import { startScheduler } from './sync/scheduler'
 
 // ---------------------------------------------------------------------------
@@ -113,12 +118,22 @@ export function createApp() {
     console.error('[API error]', err)
 
     if (err instanceof Error) {
-      const anyErr = err as Error & { status?: number; errorCode?: string }
+      const anyErr = err as Error & {
+        status?: number
+        errorCode?: string
+        sfAuthMissing?: boolean
+      }
       const isSfSessionExpired =
         anyErr.errorCode === 'INVALID_SESSION_ID' ||
         /INVALID_SESSION_ID|Session expired or invalid/i.test(err.message)
-      if (isSfSessionExpired) {
-        res.status(401).json({ error: 'Salesforce session expired', code: 'SF_SESSION_EXPIRED' })
+      if (isSfSessionExpired || anyErr.sfAuthMissing === true) {
+        res.status(401).json({
+          error: anyErr.sfAuthMissing
+            ? 'Salesforce tokens missing or stale'
+            : 'Salesforce session expired',
+          details: err.message,
+          code: 'SF_SESSION_EXPIRED',
+        })
         return
       }
       const status = anyErr.status ?? 500
@@ -137,12 +152,20 @@ export function createApp() {
 
 export async function initApp(): Promise<void> {
   try {
-    // Release any stale lock and close open log entries left by a previous
-    // process that was killed mid-sync (container restart, OOM, etc.)
+    await migrateToMultiOrg()
+    await ensureSyncLockRows()
+    await ensureOrgObjectPrimaryKeys()
+  } catch (err) {
+    console.error('[startup] Migration failed:', (err as Error).message)
+  }
+
+  try {
+    // Release any stale locks left by a process killed mid-sync (works on
+    // both legacy single-row and new per-org sync_lock shapes).
     await pool.query(
       `UPDATE sfdb.sync_lock
        SET locked = false, locked_at = NULL, job_type = NULL
-       WHERE id = 1 AND locked = true`
+       WHERE locked = true`
     )
     await pool.query(
       `UPDATE sfdb.sync_log
@@ -157,16 +180,8 @@ export async function initApp(): Promise<void> {
   }
 
   try {
-    const result = await pool.query<{ value: string }>(
-      `SELECT value FROM sfdb.app_config WHERE key = 'active_org_alias'`
-    )
-    const orgAlias = result.rows[0]?.value
-    if (orgAlias) {
-      console.log(`[startup] Starting scheduler for org: ${orgAlias}`)
-      startScheduler(orgAlias)
-    }
+    startScheduler()
   } catch (err) {
-    // DB may not be ready yet on first boot — not fatal
-    console.warn('[startup] Could not read active org alias from app_config:', (err as Error).message)
+    console.warn('[startup] Could not start scheduler:', (err as Error).message)
   }
 }

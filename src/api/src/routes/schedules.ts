@@ -1,30 +1,22 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { pool } from '../db/pool'
+import { requireOrgId } from './_orgContext'
 
 const router = Router()
 
 const DEFAULT_DELTA_INTERVAL_MINUTES = 60
 const DEFAULT_FULL_INTERVAL_HOURS = 24
 
-// ---------------------------------------------------------------------------
-// GET /api/schedules
-// Return current schedule settings
-// ---------------------------------------------------------------------------
-
-router.get('/', async (_req: Request, res: Response, next: NextFunction) => {
+router.get('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    // Read app_config values
+    const orgId = await requireOrgId(req, res)
+    if (!orgId) return
+
     const configResult = await pool.query<{ key: string; value: string }>(
-      `SELECT key, value FROM sfdb.app_config WHERE key IN ('auto_sync_enabled')`
+      `SELECT key, value FROM sfdb.app_config WHERE key = 'auto_sync_enabled'`
     )
-    const configMap = new Map<string, string>()
-    for (const row of configResult.rows) {
-      configMap.set(row.key, row.value)
-    }
+    const autoSyncEnabled = (configResult.rows[0]?.value ?? 'true') === 'true'
 
-    const autoSyncEnabled = (configMap.get('auto_sync_enabled') ?? 'true') === 'true'
-
-    // Read minimum delta interval from enabled objects (or use default)
     const intervalResult = await pool.query<{
       min_delta: number | null
       min_full: number | null
@@ -33,7 +25,8 @@ router.get('/', async (_req: Request, res: Response, next: NextFunction) => {
          MIN(delta_interval_minutes) AS min_delta,
          MIN(full_interval_hours) AS min_full
        FROM sfdb.sync_config
-       WHERE enabled = true`
+       WHERE org_id = $1 AND enabled = true`,
+      [orgId]
     )
 
     const deltaIntervalMinutes =
@@ -51,20 +44,17 @@ router.get('/', async (_req: Request, res: Response, next: NextFunction) => {
   }
 })
 
-// ---------------------------------------------------------------------------
-// PATCH /api/schedules
-// Update global sync settings and per-object intervals
-// ---------------------------------------------------------------------------
-
 router.patch('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const orgId = await requireOrgId(req, res)
+    if (!orgId) return
+
     const body = req.body as {
       autoSyncEnabled?: unknown
       deltaIntervalMinutes?: unknown
       fullIntervalHours?: unknown
     }
 
-    // Update auto_sync_enabled in app_config
     if (typeof body.autoSyncEnabled === 'boolean') {
       await pool.query(
         `INSERT INTO sfdb.app_config (key, value)
@@ -74,23 +64,21 @@ router.patch('/', async (req: Request, res: Response, next: NextFunction) => {
       )
     }
 
-    // Update delta interval for all enabled objects
     if (typeof body.deltaIntervalMinutes === 'number' && body.deltaIntervalMinutes > 0) {
       await pool.query(
         `UPDATE sfdb.sync_config
          SET delta_interval_minutes = $1
-         WHERE enabled = true`,
-        [body.deltaIntervalMinutes]
+         WHERE org_id = $2 AND enabled = true`,
+        [body.deltaIntervalMinutes, orgId]
       )
     }
 
-    // Update full interval for all enabled objects
     if (typeof body.fullIntervalHours === 'number' && body.fullIntervalHours > 0) {
       await pool.query(
         `UPDATE sfdb.sync_config
          SET full_interval_hours = $1
-         WHERE enabled = true`,
-        [body.fullIntervalHours]
+         WHERE org_id = $2 AND enabled = true`,
+        [body.fullIntervalHours, orgId]
       )
     }
 

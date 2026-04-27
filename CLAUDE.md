@@ -105,18 +105,22 @@ sf-db/
 - All database queries go through the pg pool — never create ad-hoc connections
 
 ### Postgres
-- Synced Salesforce data → `salesforce` schema
 - Internal app tables → `sfdb` schema
+- Synced Salesforce data → one schema per registered org named `org_<lowercased orgid>` (e.g. `org_00d5g000001abcdeaa`)
+- All `sfdb.*` per-object/per-field tables (`sync_config`, `field_config`, `field_metadata`, `sync_log`, `sync_lock`) are keyed by `(org_id, ...)` with `ON DELETE CASCADE` from `sfdb.orgs`
+- The active UI/sync context is stored in `sfdb.active_org` (single row); the API resolves it from `X-Org-Id` request header first, falling back to that pointer
 - Every synced table must have: `id`, `sf_created_at`, `sf_updated_at`, `sf_deleted_at`, `synced_at`
 - Field names are lowercase snake_case versions of SF API names
-- DDL is always idempotent (`IF NOT EXISTS` / `IF EXISTS`)
+- DDL is always idempotent (`IF NOT EXISTS` / `IF EXISTS`); identifiers are always quoted (objects like `Order` / `User` collide with PG reserved words)
 
 ### Sync engine
-- Always acquire `sfdb.sync_lock` before running any sync
-- Always release the lock in a `finally` block — never leave it held on error
+- Every sync entry point takes `orgId` as its primary key; alias is only used to look up an `~/.sfdx` token via `sfdb.orgs`
+- `sfdb.sync_lock` is per-org (one row per registered org). Acquire before any sync; always release in a `finally` block
+- Different orgs sync in parallel; one sync per org is serialized via that org's lock
 - If `last_delta_sync` is NULL → initial full load (no SystemModstamp WHERE clause)
 - Stale lock threshold: 30 minutes
 - Log purge runs at the start of every sync (delete rows older than `LOG_RETENTION_DAYS`)
+- The cron scheduler runs as one process with two ticks (delta per minute, full daily 02:00) that iterate every registered org
 
 ### API
 - All routes under `/api/` prefix
@@ -151,9 +155,10 @@ All runtime config (active org alias, sync intervals, enabled objects/fields) li
 
 ## Key Design Decisions (do not revisit without good reason)
 
-- **sf CLI binary is NOT in the Docker image.** Auth tokens are read directly from the `~/.sf/` JSON files mounted into the container. No `sf org display` command.
+- **sf CLI binary is NOT in the Docker image.** Auth tokens are read directly from the `~/.sfdx/` JSON files mounted into the container. No `sf org display` command.
 - **The API is not a data API.** It serves the UI and orchestrates syncs only. External tools connect directly to Postgres.
 - **Deletions are soft.** `sf_deleted_at` is set — records are never hard-deleted from the local DB.
 - **Bulk API 2.0 by default.** REST query fallback only for objects under 2,000 records.
-- **Config in DB, not `.env`.** `.env` is infrastructure only. Org alias, object selection, field selection, and schedule config all live in `sfdb.app_config` / `sfdb.sync_config` / `sfdb.field_config`.
-- **One active org at a time.** Multi-org simultaneous sync is out of scope for v1.
+- **Config in DB, not `.env`.** `.env` is infrastructure only. Org registry, object selection, field selection, and schedule config all live in `sfdb.orgs` / `sfdb.sync_config` / `sfdb.field_config` / `sfdb.app_config`.
+- **Multi-org by schema.** Every registered org gets its own `org_<orgid>` schema. Removing an org drops the schema and cascades through `sfdb.*` via the FKs on `sfdb.orgs(org_id)`.
+- **Schema name is derived from the immutable Salesforce org id**, not the user-editable alias — aliases can be renamed without affecting where the data lives.

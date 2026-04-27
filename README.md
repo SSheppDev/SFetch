@@ -31,20 +31,25 @@ A self-hosted Salesforce-to-PostgreSQL sync pipeline. Run it with `docker compos
 # 1. Authenticate a Salesforce org (skip if already done)
 sf org login web --alias my-org
 
-# 2. Configure environment
+# 2. Export decrypted Salesforce tokens for Docker to use
+npm run export-tokens
+
+# 3. Configure environment
 cp .env.example .env
 # Edit .env — set POSTGRES_PASSWORD at minimum
 
-# 3. Start
+# 4. Start
 docker compose up -d
 
-# 4. Open the UI
+# 5. Open the UI
 open http://localhost:7743
 ```
 
 First start takes ~30 seconds while Postgres initializes and the API container builds.
 
 The onboarding screen will detect your authenticated orgs and ask you to pick one. After that, go to the Objects page and enable the Salesforce objects you want to sync.
+
+`npm run export-tokens` writes plaintext access tokens to `data/tokens.json` so the Docker container can authenticate to Salesforce. This file is local-only secret material, is git-ignored, and should never be committed or shared.
 
 ## Connect a BI tool or SQL client
 
@@ -54,12 +59,12 @@ Once data is syncing, connect any Postgres-compatible tool directly:
 |----------|-----------------------|
 | Host     | `localhost`           |
 | Port     | `7745`                |
-| Database | `sfdb`               |
-| Schema   | `salesforce`          |
-| User     | `sfdb`               |
+| Database | `sfdb`                |
+| Schema   | `org_<orgid>`         |
+| User     | `sfdb`                |
 | Password | *(your `.env` value)* |
 
-The Settings page in the UI shows a copyable connection string.
+Each registered Salesforce org gets its own schema named `org_<lowercased 18-char Salesforce org id>`. The Settings page in the UI shows the schema name for every registered org and a copyable connection string.
 
 A read-only role is also available — set `READONLY_PASSWORD` in `.env` and connect as user `sfdb_readonly`.
 
@@ -103,11 +108,11 @@ Queries `SELECT Id FROM <Object>` for the full live ID set, diffs against local 
 
 ### Concurrency
 
-Only one sync runs at a time. A single-row lock table (`sfdb.sync_lock`) prevents overlap. Stale locks (> 30 min) are automatically reclaimed on startup.
+Sync is serialized per org via `sfdb.sync_lock`, with one lock row per registered org. Different orgs can sync in parallel; overlapping syncs for the same org are blocked. Stale locks (> 30 min) are automatically reclaimed on startup.
 
 ## Database schema
 
-**`salesforce` schema** — one table per enabled Salesforce object, e.g. `salesforce.account`
+**One schema per registered org** — named `org_<lowercased orgid>`, one table per enabled Salesforce object (e.g. `org_00d5g000001abcdeaa.account`)
 
 | Column | Type | Notes |
 |---|---|---|
@@ -118,7 +123,7 @@ Only one sync runs at a time. A single-row lock table (`sfdb.sync_lock`) prevent
 | `sf_deleted_at` | `timestamptz NULL` | NULL = live; set when deletion detected |
 | `synced_at` | `timestamptz` | Last written by this tool |
 
-**`sfdb` schema** — internal app tables (sync config, logs, lock, field metadata)
+**`sfdb` schema** — internal app tables (`orgs` registry, `active_org` pointer, sync config, logs, per-org lock, field metadata). Per-object tables are keyed by `(org_id, ...)`.
 
 ## Tech stack
 
@@ -127,7 +132,7 @@ Only one sync runs at a time. A single-row lock table (`sfdb.sync_lock`) prevent
 | Database | PostgreSQL 16 |
 | Backend | Node.js + TypeScript + Express |
 | Frontend | React + TypeScript + shadcn/ui + Tailwind |
-| Salesforce auth | `~/.sfdx` files read directly via Node `fs` (no `sf` binary in container) |
+| Salesforce auth | `~/.sfdx` files read directly via Node `fs` (no `sf` binary in container) — multiple orgs supported, each gets its own Postgres schema |
 | Salesforce data | jsforce + Bulk API 2.0 |
 | Scheduling | node-cron |
 | Containers | Docker + Docker Compose |

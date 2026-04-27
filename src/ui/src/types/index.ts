@@ -1,8 +1,30 @@
-export interface Org {
-  alias: string
+export interface AvailableOrg {
+  alias: string | null
   username: string
-  orgType: string
+  orgId: string
   instanceUrl: string
+  loginUrl: string
+  registered: boolean
+}
+
+export interface AvailableOrgsResponse {
+  mounted: boolean
+  orgs: AvailableOrg[]
+}
+
+export interface RegisteredOrg {
+  orgId: string
+  alias: string | null
+  username: string
+  instanceUrl: string
+  schemaName: string
+  addedAt: string
+  active: boolean
+}
+
+export interface RegisteredOrgsResponse {
+  orgs: RegisteredOrg[]
+  activeOrgId: string | null
 }
 
 export interface SObject {
@@ -68,11 +90,11 @@ export interface ConnectionDetails {
   port: number
   database: string
   user: string
-  password: string
   connectionString: string
 }
 
 export interface TableStat {
+  schemaName: string
   tableName: string
   rowCount: number
   tableSizeBytes: number
@@ -84,11 +106,12 @@ export interface DbStats {
   salesforceSizeBytes: number
   tableCount: number
   totalRows: number
+  orgs: Array<{ orgId: string; alias: string | null; schemaName: string }>
   tables: TableStat[]
 }
 
 export interface AppConfig {
-  activeOrgAlias: string | null
+  activeOrgId: string | null
   autoSyncEnabled: boolean
 }
 
