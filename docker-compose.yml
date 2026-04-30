@@ -36,6 +36,7 @@ services:
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT_INTERNAL: 5432
+      NODE_EXTRA_CA_CERTS: /usr/local/share/ca-certificates/uss-ca.crt
       # Cap V8 old-space below the cgroup limit so the GC can recover before the
       # OS kills the process. Large bulk-API result pages (700k+ records) can
       # otherwise blow past the default heap before streaming releases memory.
